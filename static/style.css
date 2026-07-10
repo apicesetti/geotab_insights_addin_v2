@@ -103,7 +103,7 @@ select {
 .threshold-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 .threshold-row input[type="range"] { flex: 1; max-width: 260px; accent-color: var(--accent); }
 
-main { padding: 24px 28px 60px; max-width: 1240px; margin: 0 auto; }
+main { margin: 0 auto; }
 
 /* --- Cards de score --- */
 .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 22px; }
