@@ -43,6 +43,7 @@ function durationToHours(value) {
 const EXCEPTION_CATEGORIES = [
   "velocidad", "frenado_brusco", "aceleracion_brusca", "giro_brusco",
   "cinturon", "distraccion", "telefono", "ralenti", "reversa", "otro",
+  "colision_frontal", "frotado_ojos", "fatiga", "bostezo", "salida_carril",
 ];
 
 // Categorías que cuentan para el puntaje general de seguridad (eventos/100km).
@@ -51,6 +52,7 @@ const EXCEPTION_CATEGORIES = [
 const SAFETY_EVENT_CATEGORIES = [
   "aceleracion_brusca", "frenado_brusco", "giro_brusco", "velocidad",
   "cinturon", "distraccion", "telefono", "reversa",
+  "colision_frontal", "frotado_ojos", "fatiga", "bostezo", "salida_carril",
 ];
 
 // eventos/100km a partir del cual el puntaje de esa categoría llega a 0.

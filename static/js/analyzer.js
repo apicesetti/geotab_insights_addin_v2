@@ -14,6 +14,11 @@ const ANALYZER_CATEGORY_LABELS = {
   ralenti: "tiempo de ralentí",
   reversa: "marcha atrás",
   otro: "otras infracciones",
+  colision_frontal: "advertencias de colisión frontal",
+  frotado_ojos: "conductor frotándose los ojos",
+  fatiga: "fatiga del conductor",
+  bostezo: "conductor bostezando",
+  salida_carril: "advertencias de salida de carril",
 };
 
 function avgOf(values) {

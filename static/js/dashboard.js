@@ -14,6 +14,8 @@ const SCORING_WEIGHTS = { safety: 0.4, efficiency: 0.3, utilization: 0.3 };
 const RULE_CATEGORY_WEIGHTS = {
   velocidad: 1.5, frenado_brusco: 1.3, aceleracion_brusca: 1.2,
   cinturon: 1.0, distraccion: 1.4, ralenti: 0.8, otro: 0.8,
+  colision_frontal: 1.6, frotado_ojos: 1.3, fatiga: 1.5,
+  bostezo: 1.3, salida_carril: 1.4,
 };
 const EFFICIENCY_IDLE_PENALTY_FACTOR = 2;
 const TREND_CHANGE_THRESHOLD_PCT = 10;

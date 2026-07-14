@@ -447,6 +447,11 @@ const EXCEPTION_CATEGORY_LABELS = {
   ralenti: "Ralentí",
   reversa: "Marcha atrás",
   otro: "Otras infracciones",
+  colision_frontal: "Advertencia de colisión frontal",
+  frotado_ojos: "Conductor frotándose los ojos",
+  fatiga: "Fatiga del conductor",
+  bostezo: "Conductor bostezando",
+  salida_carril: "Advertencia de salida de carril",
 };
 
 // Colores categóricos: orden fijo, cada categoría siempre el mismo color sin
@@ -462,6 +467,11 @@ const EXCEPTION_CATEGORY_COLORS = {
   ralenti: "#34d399",
   reversa: "#008300",
   otro: "#93a1c4",
+  colision_frontal: "#b91c1c",
+  frotado_ojos: "#eab308",
+  fatiga: "#0891b2",
+  bostezo: "#a16207",
+  salida_carril: "#4f46e5",
 };
 
 function ExceptionTimelineChart({ evolution, milestones, categories }) {
