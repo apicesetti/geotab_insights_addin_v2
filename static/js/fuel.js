@@ -131,6 +131,20 @@ function computeIdlingCost(
   };
 }
 
+// Recalcula solo lo que depende de price_per_liter (idle_cost por vehículo y
+// total), sin tocar litros/horas/eventos: así cambiar el precio del
+// combustible se refleja al instante en el front, sin volver a pedir nada a
+// la API ni recalcular el resto del dashboard.
+function recomputeIdlingCostForPrice(idlingCost, pricePerLiter) {
+  const byVehicle = idlingCost.by_vehicle.map(v => ({ ...v, idle_cost: round(v.idle_liters * pricePerLiter, 0) }));
+  return {
+    ...idlingCost,
+    price_per_liter: pricePerLiter,
+    total_idle_cost: round(idlingCost.total_idle_liters * pricePerLiter, 0),
+    by_vehicle: byVehicle,
+  };
+}
+
 function avgLPer100km(rows) {
   // Vehículos con 0 litros consumidos suelen ser falta de telemetría de combustible,
   // no consumo real: incluirlos arrastra el promedio de la clase hacia abajo sin motivo.

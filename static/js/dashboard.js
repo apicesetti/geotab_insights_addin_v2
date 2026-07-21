@@ -111,29 +111,29 @@ async function buildDashboardData(api, params) {
 
   const weekWindows = buildWeekWindowsForRange(fromDate, toDate);
 
-  const calls = [];
-  const callKinds = [];
-  weekWindows.forEach(([weekStart, weekEnd], weekIdx) => {
-    const searchRange = { fromDate: weekStart.toISOString(), toDate: weekEnd.toISOString() };
-    if (scopedGroupIds) searchRange.deviceSearch = { groups: [...scopedGroupIds].map(id => ({ id })) };
-    calls.push(["Get", { typeName: "Trip", search: searchRange }]);
-    callKinds.push(["trip", weekIdx]);
-    calls.push(["Get", { typeName: "ExceptionEvent", search: searchRange }]);
-    callKinds.push(["exception", weekIdx]);
+  // Trip y ExceptionEvent ya no se piden por semana con Get() (repetía todo
+  // el rango de nuevo en cada "Analizar"/"Actualizar"): se mantienen en un
+  // feed incremental por base de datos vía GetFeed, cacheado en IndexedDB
+  // (ver feed.js). Es un feed global, sin scope de grupo -- por eso el
+  // filtro por dispositivo de abajo ya no es solo backstop, es el único
+  // lugar donde se aplican grupo y exclusión por número de serie.
+  const [allTrips, allExceptions] = await Promise.all([
+    fetchFeedRecords(api, database, "Trip", "start", fromDate),
+    fetchFeedRecords(api, database, "ExceptionEvent", "activeFrom", fromDate),
+  ]);
+
+  let tripsByWeek = weekWindows.map(([weekStart, weekEnd]) => {
+    const from = weekStart.toISOString(), to = weekEnd.toISOString();
+    return allTrips.filter(t => t.start >= from && t.start < to);
+  });
+  let exceptionsByWeek = weekWindows.map(([weekStart, weekEnd]) => {
+    const from = weekStart.toISOString(), to = weekEnd.toISOString();
+    return allExceptions.filter(ev => ev.activeFrom >= from && ev.activeFrom < to);
   });
 
-  const results = await api.multiCall(calls);
-
-  let tripsByWeek = weekWindows.map(() => []);
-  let exceptionsByWeek = weekWindows.map(() => []);
-  callKinds.forEach(([kind, weekIdx], i) => {
-    if (kind === "trip") tripsByWeek[weekIdx] = results[i] || [];
-    else exceptionsByWeek[weekIdx] = exceptionsByWeek[weekIdx].concat(results[i] || []);
-  });
-
-  // Filtro de respaldo por dispositivo: cubre la exclusión por número de
-  // serie (que el deviceSearch por grupo no puede expresar) y actúa de
-  // backstop si el server-side no cascadea grupos como se espera.
+  // Filtro por dispositivo: cubre la exclusión por número de serie y el
+  // filtro de grupo elegido (scopedGroupIds), ninguno de los cuales se
+  // aplica server-side sobre el feed global.
   tripsByWeek = tripsByWeek.map(trips => trips.filter(t => devicesById[(t.device || {}).id] !== undefined));
   exceptionsByWeek = exceptionsByWeek.map(evs => evs.filter(ev => devicesById[(ev.device || {}).id] !== undefined));
 

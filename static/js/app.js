@@ -204,14 +204,14 @@ function IdleEstimateForm({ rates, onSaved, patchSettings }) {
   );
 }
 
-function IdlingCostPanel({ idlingCost, onPriceSaved, patchSettings }) {
+function IdlingCostPanel({ idlingCost, onFuelPriceApplied, onIdleRatesSaved, patchSettings }) {
   const [sort, onSort] = useSortableTable();
   const rows = sortRows(idlingCost.by_vehicle, sort, { device_name: v => v.device_name });
 
   return e("div", { className: "panel", style: { marginTop: 18 } },
     e("h2", null, "Costo de ralentí"),
-    e(FuelPriceForm, { pricePerLiter: idlingCost.price_per_liter, onSaved: onPriceSaved, patchSettings }),
-    e(IdleEstimateForm, { rates: idlingCost.idle_consumption_l_per_hour, onSaved: onPriceSaved, patchSettings }),
+    e(FuelPriceForm, { pricePerLiter: idlingCost.price_per_liter, onSaved: onFuelPriceApplied, patchSettings }),
+    e(IdleEstimateForm, { rates: idlingCost.idle_consumption_l_per_hour, onSaved: onIdleRatesSaved, patchSettings }),
     e("div", { className: "totals-row" },
       e("div", { className: "stat" },
         e("div", { className: "label" }, "Litros consumidos en ralentí (flota)"),
@@ -293,6 +293,7 @@ function computeLiveSavings(data, threshold) {
   const totalExcessLiters = Math.round((savings.idling_excess_liters + fuelExcessLiters) * 10) / 10;
   return {
     ...savings,
+    idling_excess_cost: Math.round(savings.idling_excess_liters * pricePerLiter),
     fuel_excess_liters: fuelExcessLiters,
     fuel_excess_cost: fuelExcessCost,
     total_excess_liters: totalExcessLiters,
@@ -824,11 +825,23 @@ function App({ api, database }) {
     }
   }
 
-  // Se llama después de guardar cualquier ajuste (precio de combustible,
-  // consumo estimado, umbral de outlier): recalcula con el valor recién
-  // guardado, sin esperar al próximo render.
+  // Se llama después de guardar consumo estimado de ralentí o umbral de
+  // outlier: a diferencia del precio, estos afectan qué litros se estiman
+  // como ralentí (no solo el costo), así que sí hace falta recalcular contra
+  // los datos ya traídos -- pero no vuelve a pedir nada a la API (Trip y
+  // ExceptionEvent salen del caché del feed) salvo lo que dependa del
+  // método de combustible en uso.
   function handleSettingsSaved(newSettings) {
     runAnalysis(false, newSettings);
+  }
+
+  // Precio del litro: no cambia litros de ralentí, solo el costo (idle_cost
+  // = idle_liters * precio), así que se recalcula 100% en el front con los
+  // litros ya calculados -- sin re-fetch ni recorrer de nuevo el resto del
+  // dashboard.
+  function handleFuelPriceApplied(newSettings) {
+    const newPrice = (newSettings.fuel && newSettings.fuel.price_per_liter) || 0;
+    setData(d => d ? { ...d, idling_cost: recomputeIdlingCostForPrice(d.idling_cost, newPrice) } : d);
   }
 
   useEffect(() => {
@@ -897,7 +910,7 @@ function App({ api, database }) {
         ),
         data.fuel_data_available
           ? e(React.Fragment, null,
-              e(IdlingCostPanel, { idlingCost: data.idling_cost, onPriceSaved: handleSettingsSaved, patchSettings }),
+              e(IdlingCostPanel, { idlingCost: data.idling_cost, onFuelPriceApplied: handleFuelPriceApplied, onIdleRatesSaved: handleSettingsSaved, patchSettings }),
               e(IdleEfficiencyPanel, { idlingCost: data.idling_cost }),
               e(FuelConsumptionPanel, { fuelConsumption: data.fuel_consumption, threshold, onThresholdChange: setThreshold, onThresholdSaved: handleSettingsSaved, patchSettings })
             )
