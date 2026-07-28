@@ -173,9 +173,16 @@ async function buildDashboardData(api, params) {
 
   let totalFuelByDevice = {};
   try {
-    const fuelUsedSearch = { fromDate: periodStart.toISOString(), toDate: periodEnd.toISOString() };
-    if (scopedGroupIds) fuelUsedSearch.deviceSearch = { groups: [...scopedGroupIds].map(id => ({ id })) };
-    const fuelUsedData = await api.call("Get", { typeName: "FuelUsed", search: fuelUsedSearch });
+    // OJO: antes esto era un Get() sin resultsLimit por TODO el período y
+    // TODA la flota de una sola vez -- Geotab trunca en silencio si hay más
+    // registros de los que entran en la respuesta default (no tira error),
+    // así que en flotas/rangos grandes esto subestimaba el combustible real
+    // sin que se note. fetchFeedRecords pagina con GetFeed hasta agotar el
+    // backlog, igual que Trip/ExceptionEvent, así que no trunca. Es un feed
+    // global (no scopeado por grupo) -- el filtro de grupo se aplica igual
+    // que en Trip, con el devicesById de más abajo.
+    const allFuelUsed = await fetchFeedRecords(api, database, "FuelUsed", "fromDate", periodStart);
+    const fuelUsedData = allFuelUsed.filter(r => r.fromDate && r.fromDate < periodEnd.toISOString());
     const summed = sumFuelUsedByDevice(fuelUsedData, "totalFuelUsed");
     totalFuelByDevice = Object.fromEntries(Object.entries(summed).filter(([d]) => devicesById[d] !== undefined));
   } catch (err) {
