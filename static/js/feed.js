@@ -12,6 +12,13 @@
 // No se scopea por grupo: es un feed global por tipo, así el filtro de
 // grupo elegido en la UI no invalida nada -- se sigue filtrando client-side
 // en dashboard.js, igual que ya hacía de backstop antes de este cambio.
+//
+// ExceptionEvent sí se scopea por regla (ruleSearch): sin esto, cada feed
+// trae TODOS los eventos de excepción de la flota (incluidas reglas no
+// mapeadas en "Configurar"), que después se descartan client-side -- son la
+// mayoría del volumen y el motivo por el que las consultas tardaban tanto.
+// Se pide un feed separado por cada regla mapeada (con su propio cursor), así
+// agregar/sacar una regla del mapeo solo afecta el feed de esa regla.
 
 const FEED_DB_NAME = "geotab_insights_feed_cache";
 const FEED_DB_VERSION = 1;
@@ -105,20 +112,24 @@ function pruneOldRecords(db, feedKey, cutoffIso) {
   });
 }
 
-// Pagina GetFeed hasta agotar el backlog: la 1ra llamada usa `search` (seed)
-// o `fromVersion` (catch-up); las siguientes siempre con el fromVersion que
-// va devolviendo, hasta que una página venga con menos de resultsLimit.
-async function drainFeed(api, db, feedKey, dateField, typeName, search, fromVersion) {
+// Pagina GetFeed hasta agotar el backlog. scopeSearch (ej. {ruleSearch:{id}})
+// se manda en TODAS las páginas, seed y catch-up, para que el alcance del
+// feed no cambie a mitad de camino -- solo fromDate va nada más que en la
+// primera (define desde cuándo arranca el historial, no el alcance).
+async function drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, seedFromDate, fromVersion) {
   let version = fromVersion;
-  let useSearch = !!search;
+  let first = true;
   while (true) {
     const params = { typeName, resultsLimit: FEED_RESULTS_LIMIT };
-    if (useSearch) params.search = search; else params.fromVersion = version;
+    const search = { ...(scopeSearch || {}) };
+    if (first && seedFromDate) search.fromDate = seedFromDate;
+    if (Object.keys(search).length) params.search = search;
+    if (version) params.fromVersion = version;
     const page = await api.call("GetFeed", params);
     const data = (page && page.data) || [];
     if (data.length) await putRecords(db, feedKey, dateField, data);
     version = page && page.toVersion;
-    useSearch = false;
+    first = false;
     if (data.length < FEED_RESULTS_LIMIT) break;
   }
   return version;
@@ -126,15 +137,18 @@ async function drainFeed(api, db, feedKey, dateField, typeName, search, fromVers
 
 // typeName: "Trip" | "ExceptionEvent". dateField: campo de fecha de ese tipo
 // usado para bucketear por semana en dashboard.js ("start" / "activeFrom").
-async function fetchFeedRecords(api, database, typeName, dateField, requestedFromDate) {
+// scope: opcional, { key, search } -- ej. { key: ruleId, search: { ruleSearch: { id: ruleId } } }
+// para pedir el feed de una sola regla en vez del feed global del tipo.
+async function fetchFeedRecords(api, database, typeName, dateField, requestedFromDate, scope) {
   const db = await openFeedDb();
-  const feedKey = database + "|" + typeName;
+  const feedKey = database + "|" + typeName + (scope ? "|" + scope.key : "");
+  const scopeSearch = scope ? scope.search : null;
   const requestedFromIso = requestedFromDate.toISOString();
   let cursor = await getCursor(db, feedKey);
 
   try {
     if (!cursor) {
-      const toVersion = await drainFeed(api, db, feedKey, dateField, typeName, { fromDate: requestedFromIso });
+      const toVersion = await drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, requestedFromIso, null);
       await putCursor(db, feedKey, toVersion, requestedFromIso);
     } else {
       let earliestSeeded = cursor.earliestSeeded;
@@ -142,18 +156,19 @@ async function fetchFeedRecords(api, database, typeName, dateField, requestedFro
         // Se pidió un rango más viejo que lo ya sembrado: GetFeed no puede
         // "retroceder" con fromVersion, así que este hueco se llena con un
         // Get puntual (no toca el cursor del feed).
-        const gap = await api.call("Get", { typeName, search: { fromDate: requestedFromIso, toDate: earliestSeeded } });
+        const gapSearch = { ...(scopeSearch || {}), fromDate: requestedFromIso, toDate: earliestSeeded };
+        const gap = await api.call("Get", { typeName, search: gapSearch });
         if (gap && gap.length) await putRecords(db, feedKey, dateField, gap);
         earliestSeeded = requestedFromIso;
       }
-      const toVersion = await drainFeed(api, db, feedKey, dateField, typeName, null, cursor.toVersion);
+      const toVersion = await drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, null, cursor.toVersion);
       await putCursor(db, feedKey, toVersion, earliestSeeded);
     }
   } catch (err) {
     // fromVersion vencido/inválido u otro error de feed: se descarta el
     // cursor y se reintenta una sola vez sembrando de cero.
     await deleteCursor(db, feedKey);
-    if (cursor) return fetchFeedRecords(api, database, typeName, dateField, requestedFromDate);
+    if (cursor) return fetchFeedRecords(api, database, typeName, dateField, requestedFromDate, scope);
     throw err;
   }
 

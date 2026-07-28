@@ -114,13 +114,25 @@ async function buildDashboardData(api, params) {
   // Trip y ExceptionEvent ya no se piden por semana con Get() (repetía todo
   // el rango de nuevo en cada "Analizar"/"Actualizar"): se mantienen en un
   // feed incremental por base de datos vía GetFeed, cacheado en IndexedDB
-  // (ver feed.js). Es un feed global, sin scope de grupo -- por eso el
+  // (ver feed.js). Trip es un feed global, sin scope de grupo -- por eso el
   // filtro por dispositivo de abajo ya no es solo backstop, es el único
-  // lugar donde se aplican grupo y exclusión por número de serie.
-  const [allTrips, allExceptions] = await Promise.all([
+  // lugar donde se aplica el filtro de grupo.
+  //
+  // ExceptionEvent se pide un feed por cada regla mapeada (ruleSearch),
+  // no uno global: sin esto se trae cada evento de excepción de la flota
+  // entera (incluidas reglas no mapeadas), que son la mayoría del volumen y
+  // se descartan igual más abajo por ruleMapping. Se agrega también la regla
+  // built-in de ralentí de Geotab (IDLING_RULE_ID) aunque no esté tildada en
+  // "Configurar": el costo de ralentí la usa siempre (ver más abajo).
+  const exceptionRuleIds = new Set([...Object.keys(ruleMapping), IDLING_RULE_ID]);
+  const [allTrips, exceptionsByRuleFeed] = await Promise.all([
     fetchFeedRecords(api, database, "Trip", "start", fromDate),
-    fetchFeedRecords(api, database, "ExceptionEvent", "activeFrom", fromDate),
+    Promise.all([...exceptionRuleIds].map(ruleId => fetchFeedRecords(
+      api, database, "ExceptionEvent", "activeFrom", fromDate,
+      { key: ruleId, search: { ruleSearch: { id: ruleId } } }
+    ))),
   ]);
+  const allExceptions = [].concat(...exceptionsByRuleFeed);
 
   let tripsByWeek = weekWindows.map(([weekStart, weekEnd]) => {
     const from = weekStart.toISOString(), to = weekEnd.toISOString();
