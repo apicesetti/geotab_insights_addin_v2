@@ -63,6 +63,19 @@ function buildWeekWindowsForRange(fromDate, toDate) {
   return windows;
 }
 
+// Índice de weekWindows al que pertenece una fecha ISO, o -1 si cae fuera de
+// rango. Usado para acumular series semanales (combustible/ralentí) a partir
+// de registros individuales (FuelUsed por evento) en vez de un feed que ya
+// venga separado por semana.
+function weekIndexForIso(weekWindows, iso) {
+  if (!iso) return -1;
+  for (let i = 0; i < weekWindows.length; i++) {
+    const [weekStart, weekEnd] = weekWindows[i];
+    if (iso >= weekStart.toISOString() && iso < weekEnd.toISOString()) return i;
+  }
+  return -1;
+}
+
 // Reglas disponibles para el panel de mapeo (excluye ZoneStop, que no aporta
 // nada como categoría de infracción).
 async function fetchRules(api) {
@@ -76,6 +89,36 @@ async function fetchRules(api) {
 async function fetchGroupTree(api) {
   const groups = await api.call("Get", { typeName: "Group" });
   return buildGroupTree(groups);
+}
+
+// {device_id: litros} a partir de un diagnóstico contador acumulado (StatusData),
+// 1 llamada por vehículo (chunked) en vez de por evento/registro: mucho más
+// liviano para flotas grandes cerca del límite de requests. Usado tanto para
+// ralentí (IDLE_FUEL_STATUS_DIAGNOSTIC_ID) como para combustible total
+// (TOTAL_FUEL_STATUS_DIAGNOSTIC_ID) cuando FuelUsed no está disponible.
+// weekWindows: si se pasa, además arma la serie semanal de flota (litros por
+// semana, sumando el delta de cada vehículo dentro de esa semana) para las
+// proyecciones -- devuelve { byDevice, weekly }.
+async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodStart, periodEnd, weekWindows) {
+  const deviceIdsList = Object.keys(devicesById);
+  const statusCalls = deviceIdsList.map(deviceId => ["Get", {
+    typeName: "StatusData",
+    search: {
+      fromDate: periodStart.toISOString(), toDate: periodEnd.toISOString(),
+      diagnosticSearch: { id: diagnosticId },
+      deviceSearch: { id: deviceId },
+    },
+  }]);
+  const statusRecordsByDevice = {};
+  const callChunks = chunked(statusCalls, FUEL_MULTICALL_CHUNK_SIZE);
+  const deviceChunks = chunked(deviceIdsList, FUEL_MULTICALL_CHUNK_SIZE);
+  for (let c = 0; c < callChunks.length; c++) {
+    const chunkResults = await api.multiCall(callChunks[c]);
+    deviceChunks[c].forEach((deviceId, i) => { statusRecordsByDevice[deviceId] = chunkResults[i] || []; });
+  }
+  const byDevice = computeFuelDeltaFromStatusData(statusRecordsByDevice);
+  const weekly = weekWindows ? computeWeeklyFuelDeltaFromStatusData(statusRecordsByDevice, weekWindows) : null;
+  return { byDevice, weekly };
 }
 
 // params: { database, fromDate, toDate, ruleMapping, groupFilterId, dbSettings }
@@ -172,6 +215,7 @@ async function buildDashboardData(api, params) {
   const periodEnd = weekWindows[weekWindows.length - 1][1];
 
   let totalFuelByDevice = {};
+  let weeklyFuelLiters = new Array(weekWindows.length).fill(0);
   try {
     // OJO: antes esto era un Get() sin resultsLimit por TODO el período y
     // TODA la flota de una sola vez -- Geotab trunca en silencio si hay más
@@ -185,34 +229,43 @@ async function buildDashboardData(api, params) {
     const fuelUsedData = allFuelUsed.filter(r => r.fromDate && r.fromDate < periodEnd.toISOString());
     const summed = sumFuelUsedByDevice(fuelUsedData, "totalFuelUsed");
     totalFuelByDevice = Object.fromEntries(Object.entries(summed).filter(([d]) => devicesById[d] !== undefined));
+    weeklyFuelLiters = sumByWeek(fuelUsedData, weekWindows, "fromDate", "totalFuelUsed");
   } catch (err) {
     // FuelUsed no disponible en esta base de datos: seguimos sin datos de combustible.
   }
 
+  // FuelUsed es un valor que Geotab calcula a partir de telemetría de motor
+  // (RPM, carga, etc.). En bases donde el vehículo no reporta esa telemetría,
+  // el feed viene vacío o en 0 para toda la flota aunque el consumo real sí
+  // se mida vía el diagnóstico contador TOTAL_FUEL_STATUS_DIAGNOSTIC_ID (mismo
+  // caso que ya existía para el ralentí). Se usa como fallback automático,
+  // no como método por defecto, para no sumarle una llamada por vehículo a
+  // las bases donde FuelUsed ya funciona.
+  const noFuelUsedData = Object.keys(totalFuelByDevice).length === 0
+    || Object.values(totalFuelByDevice).every(l => l <= 0);
+  if (noFuelUsedData) {
+    try {
+      const result = await fetchFuelDiagnosticDelta(
+        api, devicesById, TOTAL_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+      );
+      totalFuelByDevice = result.byDevice;
+      weeklyFuelLiters = result.weekly;
+    } catch (err) {
+      // Diagnóstico tampoco disponible en esta base: seguimos sin datos de combustible.
+    }
+  }
+
   const idleFuelMethod = fuelCfg.idle_fuel_method || "fuel_used_per_event";
   let idleFuelByDevice = {};
+  let weeklyIdleLiters = new Array(weekWindows.length).fill(0);
 
   if (idleFuelMethod === "status_data") {
-    // 1 llamada por vehículo (chunked) en vez de 1 por evento de ralentí:
-    // mucho más liviano para flotas grandes cerca del límite de requests.
     try {
-      const deviceIdsList = Object.keys(devicesById);
-      const statusCalls = deviceIdsList.map(deviceId => ["Get", {
-        typeName: "StatusData",
-        search: {
-          fromDate: periodStart.toISOString(), toDate: periodEnd.toISOString(),
-          diagnosticSearch: { id: IDLE_FUEL_STATUS_DIAGNOSTIC_ID },
-          deviceSearch: { id: deviceId },
-        },
-      }]);
-      const statusRecordsByDevice = {};
-      const callChunks = chunked(statusCalls, FUEL_MULTICALL_CHUNK_SIZE);
-      const deviceChunks = chunked(deviceIdsList, FUEL_MULTICALL_CHUNK_SIZE);
-      for (let c = 0; c < callChunks.length; c++) {
-        const chunkResults = await api.multiCall(callChunks[c]);
-        deviceChunks[c].forEach((deviceId, i) => { statusRecordsByDevice[deviceId] = chunkResults[i] || []; });
-      }
-      idleFuelByDevice = computeIdleFuelFromStatusData(statusRecordsByDevice);
+      const result = await fetchFuelDiagnosticDelta(
+        api, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+      );
+      idleFuelByDevice = result.byDevice;
+      weeklyIdleLiters = result.weekly;
     } catch (err) {
       // Diagnóstico no disponible en esta base de datos.
     }
@@ -223,6 +276,7 @@ async function buildDashboardData(api, params) {
     try {
       const idleCalls = [];
       const idleCallDevices = [];
+      const idleCallWeekIdx = [];
       for (const ev of idlingEvents) {
         const deviceId = (ev.device || {}).id;
         const activeFrom = ev.activeFrom;
@@ -230,20 +284,39 @@ async function buildDashboardData(api, params) {
         if (!deviceId || !activeFrom || !activeTo) continue;
         idleCalls.push(["Get", { typeName: "FuelUsed", search: { deviceSearch: { id: deviceId }, fromDate: activeFrom, toDate: activeTo } }]);
         idleCallDevices.push(deviceId);
+        idleCallWeekIdx.push(weekIndexForIso(weekWindows, activeFrom));
       }
       const callChunks = chunked(idleCalls, FUEL_MULTICALL_CHUNK_SIZE);
       const deviceChunks = chunked(idleCallDevices, FUEL_MULTICALL_CHUNK_SIZE);
+      const weekIdxChunks = chunked(idleCallWeekIdx, FUEL_MULTICALL_CHUNK_SIZE);
       for (let c = 0; c < callChunks.length; c++) {
         const chunkResults = await api.multiCall(callChunks[c]);
         deviceChunks[c].forEach((deviceId, i) => {
+          const weekIdx = weekIdxChunks[c][i];
           for (const r of (chunkResults[i] || [])) {
-            const liters = r.totalIdlingFuelUsedL != null ? r.totalIdlingFuelUsedL : r.totalFuelUsed;
-            idleFuelByDevice[deviceId] = (idleFuelByDevice[deviceId] || 0) + (parseFloat(liters) || 0);
+            const liters = parseFloat(r.totalIdlingFuelUsedL != null ? r.totalIdlingFuelUsedL : r.totalFuelUsed) || 0;
+            idleFuelByDevice[deviceId] = (idleFuelByDevice[deviceId] || 0) + liters;
+            if (weekIdx >= 0) weeklyIdleLiters[weekIdx] += liters;
           }
         });
       }
     } catch (err) {
       // No se pudo medir combustible de ralentí por evento en esta base.
+    }
+
+    // Igual que con el combustible total: si hubo eventos de ralentí pero
+    // FuelUsed no devolvió nada para ninguno (base sin telemetría de motor),
+    // se cae automáticamente al diagnóstico contador acumulado.
+    if (idlingEvents.length > 0 && Object.keys(idleFuelByDevice).length === 0) {
+      try {
+        const result = await fetchFuelDiagnosticDelta(
+          api, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+        );
+        idleFuelByDevice = result.byDevice;
+        weeklyIdleLiters = result.weekly;
+      } catch (err) {
+        // Diagnóstico tampoco disponible en esta base.
+      }
     }
   }
 
@@ -307,6 +380,17 @@ async function buildDashboardData(api, params) {
   const ruleLabels = {};
   for (const rid of Object.keys(ruleMapping)) ruleLabels[rid] = rulesById[rid] || rid;
 
+  // Series semanales de flota para la pestaña de Proyecciones (projections.js):
+  // solo categorías de riesgo con al menos un evento en el período, para no
+  // llenar la UI de proyecciones en 0 de infracciones que este cliente no usa.
+  const riskCategoriesWithData = SAFETY_EVENT_CATEGORIES.filter(cat =>
+    weeklyMetrics.some(wm => (wm.exceptions_by_category[cat] || 0) > 0)
+  );
+  const weeklyEventsByCategory = {};
+  for (const cat of riskCategoriesWithData) {
+    weeklyEventsByCategory[cat] = weeklyMetrics.map(wm => wm.exceptions_by_category[cat] || 0);
+  }
+
   return {
     client: { database },
     generated_at: new Date().toISOString(),
@@ -319,6 +403,11 @@ async function buildDashboardData(api, params) {
     fuel_consumption: fuelConsumption,
     savings_opportunity: savingsOpportunity,
     fuel_data_available: fuelDataAvailable,
+    weekly_series: {
+      fuel_liters: weeklyFuelLiters.map(v => round(v, 1)),
+      idle_liters: weeklyIdleLiters.map(v => round(v, 1)),
+      events_by_category: weeklyEventsByCategory,
+    },
     opportunities,
     fleet_summary: {
       total_devices: totalDeviceCount,

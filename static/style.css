@@ -103,6 +103,17 @@ select {
 .threshold-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 .threshold-row input[type="range"] { flex: 1; max-width: 260px; accent-color: var(--accent); }
 
+.tab-bar {
+  display: flex; gap: 4px; margin-bottom: 18px; border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.tab-btn {
+  background: transparent; color: var(--text-dim); border: none; border-bottom: 2px solid transparent;
+  padding: 10px 16px; font-size: 13.5px; font-weight: 600; cursor: pointer; margin-bottom: -1px;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
 main { margin: 0 auto; }
 
 /* --- Cards de score --- */

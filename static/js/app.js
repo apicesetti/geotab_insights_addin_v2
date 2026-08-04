@@ -670,6 +670,78 @@ function ExceptionRatePanel({ evolution, exceptionCategories, ruleLabels }) {
   );
 }
 
+function trendLabel(pct) {
+  if (pct > 0.5) return "▲ +" + formatNumber(pct, 1) + "%/sem";
+  if (pct < -0.5) return "▼ " + formatNumber(pct, 1) + "%/sem";
+  return "≈ estable";
+}
+
+function ProjectionStat({ label, valueLabel, subLabel, growthPct }) {
+  return e("div", { className: "stat" },
+    e("div", { className: "label" }, label),
+    e("div", { className: "value" }, valueLabel),
+    e("div", { style: { color: "var(--text-dim)", fontSize: 12, marginTop: 4 } },
+      subLabel ? subLabel + " · " + trendLabel(growthPct) : trendLabel(growthPct)
+    )
+  );
+}
+
+// Proyección a futuro de flota (combustible, ralentí, eventos de riesgo) a partir
+// de las series semanales del período ya analizado (data.weekly_series). Se
+// recalcula 100% en el front al cambiar el horizonte -- sin re-fetch, mismo
+// patrón que el umbral de outliers y el precio de combustible.
+function ProjectionsPanel({ weeklySeries, pricePerLiter, fuelDataAvailable }) {
+  const [horizon, setHorizon] = useState(4);
+  const projections = buildProjections(weeklySeries, pricePerLiter, horizon);
+  const categoryEntries = Object.entries(projections.events_by_category)
+    .sort((a, b) => b[1].projected_total - a[1].projected_total);
+
+  return e("div", { className: "panel", style: { marginTop: 18 } },
+    e("h2", null, "Proyección a futuro"),
+    e("div", { className: "info-box", style: { marginBottom: 14 } },
+      "Estimación simple para planificar (no un pronóstico exacto): parte del promedio de las últimas " +
+      PROJECTION_BASE_WEEKS + " semanas y lo ajusta por la tendencia entre la primera y la segunda mitad del período analizado."
+    ),
+    e("div", { className: "threshold-row" },
+      e("span", { style: { color: "var(--text-dim)", fontSize: 13 } }, "Horizonte:"),
+      e("input", {
+        type: "number", min: 1, max: 52, step: 1, style: { width: 70 }, value: horizon,
+        onChange: ev => setHorizon(Math.max(1, parseInt(ev.target.value, 10) || 1)),
+      }),
+      e("span", { style: { color: "var(--text-dim)", fontSize: 13 } }, "semanas")
+    ),
+    e("div", { className: "totals-row", style: { marginTop: 14 } },
+      fuelDataAvailable && e(ProjectionStat, {
+        label: "Combustible proyectado (" + horizon + " sem.)",
+        valueLabel: formatNumber(projections.fuel.projected_total, 1) + " L",
+        subLabel: formatMoney(projections.fuel.projected_cost),
+        growthPct: projections.fuel.weekly_growth_pct,
+      }),
+      fuelDataAvailable && e(ProjectionStat, {
+        label: "Ralentí proyectado (" + horizon + " sem.)",
+        valueLabel: formatNumber(projections.idle.projected_total, 1) + " L",
+        subLabel: formatMoney(projections.idle.projected_cost),
+        growthPct: projections.idle.weekly_growth_pct,
+      }),
+      e(ProjectionStat, {
+        label: "Eventos de riesgo proyectados (" + horizon + " sem.)",
+        valueLabel: formatNumber(projections.events_total.projected_total, 0),
+        growthPct: projections.events_total.weekly_growth_pct,
+      })
+    ),
+    categoryEntries.length > 0 && e("table", { className: "data-table", style: { marginTop: 14 } },
+      e("thead", null, e("tr", null,
+        e("th", null, "Categoría"), e("th", null, "Proyectado (" + horizon + " sem.)"), e("th", null, "Tendencia")
+      )),
+      e("tbody", null, categoryEntries.map(([cat, proj]) => e("tr", { key: cat },
+        e("td", null, EXCEPTION_CATEGORY_LABELS[cat] || cat),
+        e("td", { className: "num" }, formatNumber(proj.projected_total, 0)),
+        e("td", { className: "num" }, trendLabel(proj.weekly_growth_pct))
+      )))
+    )
+  );
+}
+
 function Findings({ opportunities }) {
   if (!opportunities || opportunities.length === 0) {
     return e("div", { className: "finding-desc" }, "No se detectaron hallazgos relevantes en el período.");
@@ -780,6 +852,23 @@ function RuleMappingPanel({ api, config, onChange }) {
   );
 }
 
+const TABS = [
+  { id: "resumen", label: "Resumen" },
+  { id: "combustible", label: "Combustible" },
+  { id: "seguridad", label: "Seguridad y eventos" },
+  { id: "oportunidades", label: "Oportunidades" },
+];
+
+function TabBar({ active, onChange }) {
+  return e("div", { className: "tab-bar" },
+    TABS.map(t => e("button", {
+      key: t.id,
+      className: "tab-btn" + (active === t.id ? " active" : ""),
+      onClick: () => onChange(t.id),
+    }, t.label))
+  );
+}
+
 function App({ api, database }) {
   const [dateRange, setDateRange] = useState(defaultDateRange());
   const [showConfig, setShowConfig] = useState(true);
@@ -789,6 +878,7 @@ function App({ api, database }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [activeTab, setActiveTab] = useState("resumen");
 
   function patchSettings(patch) {
     return updateDbSettings(database, settings, patch).then(newSettings => {
@@ -893,8 +983,9 @@ function App({ api, database }) {
           e(ScoreCard, { label: "EFICIENCIA", value: data.score.efficiency }),
           e(ScoreCard, { label: "UTILIZACIÓN", value: data.score.utilization })
         ),
-        data.fuel_data_available && e(SavingsOpportunityPanel, { savings: computeLiveSavings(data, threshold) }),
-        e("div", { className: "grid-2" },
+        e(TabBar, { active: activeTab, onChange: setActiveTab }),
+
+        activeTab === "resumen" && e("div", { className: "grid-2" },
           e("div", { className: "panel" },
             e("h2", null, "Evolución semanal (" + data.weeks_analyzed + " semanas)"),
             e(EvolutionChart, { evolution: data.evolution })
@@ -908,21 +999,36 @@ function App({ api, database }) {
             e("div", { className: "summary-row" }, e("span", null, "Generado"), e("span", null, new Date(data.generated_at).toLocaleString()))
           )
         ),
-        data.fuel_data_available
-          ? e(React.Fragment, null,
-              e(IdlingCostPanel, { idlingCost: data.idling_cost, onFuelPriceApplied: handleFuelPriceApplied, onIdleRatesSaved: handleSettingsSaved, patchSettings }),
-              e(IdleEfficiencyPanel, { idlingCost: data.idling_cost }),
-              e(FuelConsumptionPanel, { fuelConsumption: data.fuel_consumption, threshold, onThresholdChange: setThreshold, onThresholdSaved: handleSettingsSaved, patchSettings })
-            )
-          : e("div", { className: "panel", style: { marginTop: 18 } },
-              e("h2", null, "Costo de ralentí y consumo de combustible"),
-              e("div", { className: "info-box" }, "Este cliente no reporta datos de combustible en MyGeotab (objeto FuelUsed no disponible).")
-            ),
-        e(ExceptionTimelinePanel, { evolution: data.evolution, clientId: database, exceptionCategories: data.exception_categories }),
-        e(ExceptionRatePanel, { evolution: data.evolution, exceptionCategories: data.exception_categories, ruleLabels: data.rule_labels }),
-        e("div", { className: "panel", style: { marginTop: 18 } },
-          e("h2", null, "Oportunidades de mejora y logros"),
-          e(Findings, { opportunities: data.opportunities })
+
+        activeTab === "combustible" && (
+          data.fuel_data_available
+            ? e(React.Fragment, null,
+                e(IdlingCostPanel, { idlingCost: data.idling_cost, onFuelPriceApplied: handleFuelPriceApplied, onIdleRatesSaved: handleSettingsSaved, patchSettings }),
+                e(IdleEfficiencyPanel, { idlingCost: data.idling_cost }),
+                e(FuelConsumptionPanel, { fuelConsumption: data.fuel_consumption, threshold, onThresholdChange: setThreshold, onThresholdSaved: handleSettingsSaved, patchSettings })
+              )
+            : e("div", { className: "panel" },
+                e("h2", null, "Costo de ralentí y consumo de combustible"),
+                e("div", { className: "info-box" }, "Este cliente no reporta datos de combustible en MyGeotab (objeto FuelUsed no disponible).")
+              )
+        ),
+
+        activeTab === "seguridad" && e(React.Fragment, null,
+          e(ExceptionTimelinePanel, { evolution: data.evolution, clientId: database, exceptionCategories: data.exception_categories }),
+          e(ExceptionRatePanel, { evolution: data.evolution, exceptionCategories: data.exception_categories, ruleLabels: data.rule_labels })
+        ),
+
+        activeTab === "oportunidades" && e(React.Fragment, null,
+          data.fuel_data_available && e(SavingsOpportunityPanel, { savings: computeLiveSavings(data, threshold) }),
+          e(ProjectionsPanel, {
+            weeklySeries: data.weekly_series,
+            pricePerLiter: data.idling_cost.price_per_liter || 0,
+            fuelDataAvailable: data.fuel_data_available,
+          }),
+          e("div", { className: "panel", style: { marginTop: 18 } },
+            e("h2", null, "Oportunidades de mejora y logros"),
+            e(Findings, { opportunities: data.opportunities })
+          )
         )
       )
     )

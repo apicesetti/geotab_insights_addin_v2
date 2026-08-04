@@ -10,6 +10,14 @@ const IDLING_RULE_ID = "RuleIdlingId";
 // 1 por evento, mucho más liviano para flotas grandes cerca del límite de requests.
 const IDLE_FUEL_STATUS_DIAGNOSTIC_ID = "DiagnosticDeviceTotalIdleFuelId";
 
+// Mismo patrón que IDLE_FUEL_STATUS_DIAGNOSTIC_ID pero para el combustible
+// total (no solo ralentí): contador acumulado desde la instalación del
+// dispositivo. FuelUsed es un dato calculado por Geotab a partir de la
+// telemetría de motor (RPM, carga, etc.); en bases donde el vehículo no
+// reporta esa telemetría, FuelUsed queda vacío/en 0 para todos los vehículos
+// aunque el consumo real sí se mida vía este diagnóstico.
+const TOTAL_FUEL_STATUS_DIAGNOSTIC_ID = "DiagnosticDeviceTotalFuelId";
+
 // Comparar consumo contra un único promedio de flota penaliza a los vehículos pesados
 // solo por serlo. Se buscan grupos de Geotab que el cliente ya usa para clasificar por
 // tipo/peso de vehículo (ej. "Pesados" / "Livianos") y se compara cada vehículo contra
@@ -45,12 +53,28 @@ function sumFuelUsedByDevice(records, field) {
   return totals;
 }
 
-// statusRecordsByDevice: {device_id: [StatusData record, ...]} del diagnóstico
-// IDLE_FUEL_STATUS_DIAGNOSTIC_ID en el período. Es un contador acumulado desde
-// la instalación del dispositivo, así que los litros reales usados en el
-// período son max(data) - min(data) por vehículo. Misma forma de salida que
-// sumFuelUsedByDevice: {device_id: litros}.
-function computeIdleFuelFromStatusData(statusRecordsByDevice) {
+// Registros con una fecha ISO (dateField) y un valor numérico (valueField) ->
+// array paralelo a weekWindows con la suma de valueField en cada semana.
+// Usado para armar la serie semanal de flota que alimenta las proyecciones
+// (fuel.js/dashboard.js) a partir de FuelUsed (fromDate/totalFuelUsed).
+function sumByWeek(records, weekWindows, dateField, valueField) {
+  return weekWindows.map(([weekStart, weekEnd]) => {
+    const from = weekStart.toISOString(), to = weekEnd.toISOString();
+    let total = 0;
+    for (const r of records) {
+      const d = r[dateField];
+      if (d && d >= from && d < to) total += parseFloat(r[valueField]) || 0.0;
+    }
+    return total;
+  });
+}
+
+// statusRecordsByDevice: {device_id: [StatusData record, ...]} de un diagnóstico
+// contador acumulado (IDLE_FUEL_STATUS_DIAGNOSTIC_ID o TOTAL_FUEL_STATUS_DIAGNOSTIC_ID)
+// en el período. Es un contador acumulado desde la instalación del dispositivo,
+// así que los litros reales usados en el período son max(data) - min(data) por
+// vehículo. Misma forma de salida que sumFuelUsedByDevice: {device_id: litros}.
+function computeFuelDeltaFromStatusData(statusRecordsByDevice) {
   const deltas = {};
   for (const [deviceId, records] of Object.entries(statusRecordsByDevice)) {
     const values = records.map(r => r.data).filter(v => v != null).map(Number);
@@ -61,9 +85,27 @@ function computeIdleFuelFromStatusData(statusRecordsByDevice) {
   return deltas;
 }
 
+// Misma fuente (statusRecordsByDevice) que computeFuelDeltaFromStatusData,
+// pero agrupada en el delta de flota (todos los vehículos) por semana en vez
+// del delta total por vehículo: array paralelo a weekWindows con los litros
+// consumidos esa semana. weekWindows: [[weekStart, weekEnd], ...] (Date).
+function computeWeeklyFuelDeltaFromStatusData(statusRecordsByDevice, weekWindows) {
+  return weekWindows.map(([weekStart, weekEnd]) => {
+    const from = weekStart.toISOString(), to = weekEnd.toISOString();
+    let total = 0;
+    for (const records of Object.values(statusRecordsByDevice)) {
+      const values = records
+        .filter(r => r.dateTime && r.dateTime >= from && r.dateTime < to)
+        .map(r => r.data).filter(v => v != null).map(Number);
+      if (values.length >= 2) total += Math.max(...values) - Math.min(...values);
+    }
+    return total;
+  });
+}
+
 // exceptionsAll: lista plana de ExceptionEvent (todas las semanas juntas).
 // idleFuelDeltas: {device_id: litros}, de FuelUsed por evento de ralentí o del
-//   diagnóstico acumulado DiagnosticDeviceTotalIdleFuelId (computeIdleFuelFromStatusData).
+//   diagnóstico acumulado DiagnosticDeviceTotalIdleFuelId (computeFuelDeltaFromStatusData).
 //   Si un vehículo no tiene entrada acá, no hay medición de ralentí vía diagnosticId
 //   y su consumo se estima por horas en vez de medirse.
 // vehicleClassByDevice: {device_id: 'pesados'|'livianos'|'otros'}.
