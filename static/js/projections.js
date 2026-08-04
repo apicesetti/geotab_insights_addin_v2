@@ -1,9 +1,9 @@
 // Proyección a futuro de flota: promedio móvil de las últimas semanas,
-// ajustado por la tendencia observada entre la primera y la segunda mitad
-// del período analizado, y extendido semana a semana en forma compuesta.
-// Deliberadamente simple (no regresión): con 12 semanas de datos típicas,
-// un modelo más sofisticado da una falsa sensación de precisión sin
-// aportar mejor señal. Depende de round (utils.js).
+// ajustado por la tendencia entre esas semanas y la ventana inmediatamente
+// anterior, y extendido semana a semana en forma compuesta. Deliberadamente
+// simple (no regresión): con 12 semanas de datos típicas, un modelo más
+// sofisticado da una falsa sensación de precisión sin aportar mejor señal.
+// Depende de round (utils.js).
 
 // Cuántas semanas recientes se promedian para el nivel "actual" del que
 // arranca la proyección.
@@ -16,9 +16,14 @@ const PROJECTION_BASE_WEEKS = 4;
 // Método:
 // 1. base_weekly_avg = promedio de las últimas PROJECTION_BASE_WEEKS semanas
 //    (el nivel "actual" de la métrica).
-// 2. weekly_growth_pct = % de cambio entre el promedio de la primera mitad
-//    del período y el de la segunda mitad, repartido entre la cantidad de
-//    semanas de esa mitad (una tasa de crecimiento semanal implícita).
+// 2. weekly_growth_pct = % de cambio entre esas últimas PROJECTION_BASE_WEEKS
+//    semanas (recentWeeks) y las PROJECTION_BASE_WEEKS semanas inmediatamente
+//    anteriores (priorWeeks), repartido entre el largo de esa ventana (una
+//    tasa de crecimiento semanal implícita). Se compara contra la ventana
+//    previa, no contra el arranque de todo el período analizado: una regla o
+//    alerta activada a mitad de período (o cualquier métrica que arranca en
+//    0) no debe "esconder" un cambio de tendencia reciente detrás del
+//    promedio de meses donde la métrica todavía no existía.
 // 3. Cada semana futura = base_weekly_avg * (1 + weekly_growth_pct)^semana,
 //    o sea la tendencia observada se aplica de forma compuesta hacia adelante.
 function computeTrendProjection(weeklyValues, horizonWeeks) {
@@ -32,13 +37,13 @@ function computeTrendProjection(weeklyValues, horizonWeeks) {
   const baseWeeks = weeklyValues.slice(-PROJECTION_BASE_WEEKS);
   const baseWeeklyAvg = avg(baseWeeks);
 
-  const halfLen = Math.floor(n / 2);
+  const windowLen = Math.min(PROJECTION_BASE_WEEKS, Math.floor(n / 2));
   let weeklyGrowthRate = 0;
-  if (halfLen >= 1) {
-    const firstHalfAvg = avg(weeklyValues.slice(0, halfLen));
-    const secondHalfAvg = avg(weeklyValues.slice(n - halfLen));
-    if (firstHalfAvg > 0) {
-      weeklyGrowthRate = ((secondHalfAvg - firstHalfAvg) / firstHalfAvg) / halfLen;
+  if (windowLen >= 1) {
+    const recentAvg = avg(weeklyValues.slice(-windowLen));
+    const priorAvg = avg(weeklyValues.slice(-windowLen * 2, -windowLen));
+    if (priorAvg > 0) {
+      weeklyGrowthRate = ((recentAvg - priorAvg) / priorAvg) / windowLen;
     }
   }
 
