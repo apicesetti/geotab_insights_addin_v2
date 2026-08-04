@@ -340,6 +340,18 @@ async function buildDashboardData(api, params) {
       : null;
   }
 
+  // weeklyIdleLiters hasta acá solo tiene litros medidos (FuelUsed/diagnosticId);
+  // le suma la parte estimada por horas de los vehículos sin medición real, para
+  // que la serie semanal (y su proyección) coincida con el total que ya muestra
+  // el panel de "Costo de ralentí" (computeIdlingCost).
+  const estimatedIdleDeviceIds = new Set(
+    idlingCost.by_vehicle.filter(v => v.is_estimated).map(v => v.device_id)
+  );
+  const weeklyEstimatedIdleLiters = computeWeeklyEstimatedIdleLiters(
+    idlingEvents, weekWindows, estimatedIdleDeviceIds, vehicleClassByDevice, idleRatesCfg
+  );
+  weeklyIdleLiters = weeklyIdleLiters.map((v, i) => v + weeklyEstimatedIdleLiters[i]);
+
   const fuelConsumption = computeFuelOutliers(
     totalFuelByDevice, distanceByDevice, devicesById, vehicleClassByDevice,
     fuelCfg.consumption_outlier_threshold_pct != null ? fuelCfg.consumption_outlier_threshold_pct : 20

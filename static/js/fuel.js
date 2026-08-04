@@ -173,6 +173,31 @@ function computeIdlingCost(
   };
 }
 
+// Réplica semanal de la rama "isEstimated" de computeIdlingCost (hours*rate),
+// para los vehículos que quedaron sin medición real: sin esto, la serie
+// semanal de ralentí (weekly_series.idle_liters, usada por las proyecciones)
+// solo ve litros medidos y da 0 en flotas donde el ralentí de casi todos los
+// vehículos se estima por horas -- aunque computeIdlingCost sí lo cuente en
+// el total del período.
+// idlingEvents: ExceptionEvent ya filtrados a reglas de ralentí (idleRuleIds).
+// estimatedDeviceIds: Set de device_id con is_estimated=true en computeIdlingCost.
+// weekWindows: [[weekStart, weekEnd], ...] (Date).
+function computeWeeklyEstimatedIdleLiters(idlingEvents, weekWindows, estimatedDeviceIds, vehicleClassByDevice, idleConsumptionEstimates) {
+  const weekly = new Array(weekWindows.length).fill(0);
+  for (const ev of idlingEvents) {
+    const deviceId = (ev.device || {}).id;
+    if (!deviceId || !estimatedDeviceIds.has(deviceId)) continue;
+    const weekIdx = weekIndexForIso(weekWindows, ev.activeFrom);
+    if (weekIdx < 0) continue;
+    const vehicleClass = vehicleClassByDevice[deviceId] || "otros";
+    const rate = idleConsumptionEstimates[vehicleClass] != null
+      ? idleConsumptionEstimates[vehicleClass]
+      : DEFAULT_IDLE_CONSUMPTION_L_PER_HOUR;
+    weekly[weekIdx] += durationToHours(ev.duration) * rate;
+  }
+  return weekly;
+}
+
 // Recalcula solo lo que depende de price_per_liter (idle_cost por vehículo y
 // total), sin tocar litros/horas/eventos: así cambiar el precio del
 // combustible se refleja al instante en el front, sin volver a pedir nada a
