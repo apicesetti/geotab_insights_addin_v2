@@ -62,10 +62,10 @@ function computeIdleFuelFromStatusData(statusRecordsByDevice) {
 }
 
 // exceptionsAll: lista plana de ExceptionEvent (todas las semanas juntas).
-// idleFuelDeltas: {device_id: litros}, de FuelUsed por evento de ralentí.
-// devicesWithFuelData: Set de device_id que reportan FuelUsed en el período
-//   (si un vehículo no está acá, no tiene telemetría de combustible y su ralentí
-//   se estima por horas en vez de medirse).
+// idleFuelDeltas: {device_id: litros}, de FuelUsed por evento de ralentí o del
+//   diagnóstico acumulado DiagnosticDeviceTotalIdleFuelId (computeIdleFuelFromStatusData).
+//   Si un vehículo no tiene entrada acá, no hay medición de ralentí vía diagnosticId
+//   y su consumo se estima por horas en vez de medirse.
 // vehicleClassByDevice: {device_id: 'pesados'|'livianos'|'otros'}.
 // idleConsumptionEstimates: {vehicle_class: litros/hora} para estimar el ralentí de
 //   vehículos sin medición de combustible.
@@ -75,7 +75,7 @@ function computeIdleFuelFromStatusData(statusRecordsByDevice) {
 //   built-in de Geotab, algunos clientes miden ralentí con una regla 'Custom'
 //   propia mapeada a la categoría "ralenti" en su rule_mapping.
 function computeIdlingCost(
-  exceptionsAll, idleFuelDeltas, devicesWithFuelData, vehicleClassByDevice,
+  exceptionsAll, idleFuelDeltas, vehicleClassByDevice,
   idleConsumptionEstimates, devicesById, pricePerLiter, idleRuleIds
 ) {
   idleRuleIds = idleRuleIds || new Set([IDLING_RULE_ID]);
@@ -94,7 +94,7 @@ function computeIdlingCost(
   const byVehicle = [];
   for (const deviceId of deviceIds) {
     const stats = eventsByDevice[deviceId] || { count: 0, hours: 0.0 };
-    const isEstimated = !devicesWithFuelData.has(deviceId);
+    const isEstimated = idleFuelDeltas[deviceId] == null;
     let liters;
     if (isEstimated) {
       const vehicleClass = vehicleClassByDevice[deviceId] || "otros";

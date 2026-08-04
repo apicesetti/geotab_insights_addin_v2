@@ -248,11 +248,10 @@ async function buildDashboardData(api, params) {
   }
 
   const fuelDataAvailable = Object.keys(totalFuelByDevice).length > 0 || Object.keys(idleFuelByDevice).length > 0;
-  const devicesWithFuelData = new Set(Object.entries(totalFuelByDevice).filter(([, l]) => l > 0).map(([d]) => d));
   const idleRatesCfg = fuelCfg.idle_consumption_l_per_hour || {};
 
   const idlingCost = computeIdlingCost(
-    exceptionsAll, idleFuelByDevice, devicesWithFuelData, vehicleClassByDevice,
+    exceptionsAll, idleFuelByDevice, vehicleClassByDevice,
     idleRatesCfg, devicesById, pricePerLiter, idleRuleIds
   );
 
