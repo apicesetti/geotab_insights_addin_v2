@@ -269,8 +269,14 @@ function computeFuelOutliers(fuelDeltas, distanceByDevice, devicesById, vehicleC
   const classAvgsRounded = {};
   for (const [cls, v] of Object.entries(classAvgs)) classAvgsRounded[cls] = round(v, 2);
 
+  // Suma directo de fuelDeltas (no de "rows"): rows solo tiene vehículos con
+  // distancia registrada en el período, así que un vehículo con combustible
+  // pero sin viajes en el rango quedaría afuera del total de flota.
+  const fleetTotalLiters = round(Object.values(fuelDeltas).reduce((s, l) => s + (l || 0), 0), 1);
+
   return {
     fleet_avg_l_per_100km: round(fleetAvg, 2),
+    fleet_total_liters: fleetTotalLiters,
     class_avgs_l_per_100km: classAvgsRounded,
     outlier_threshold_pct: thresholdPct,
     by_vehicle: rows,

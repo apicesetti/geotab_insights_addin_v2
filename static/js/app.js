@@ -301,7 +301,7 @@ function computeLiveSavings(data, threshold) {
   };
 }
 
-function FuelConsumptionPanel({ fuelConsumption, threshold, onThresholdChange, onThresholdSaved, patchSettings }) {
+function FuelConsumptionPanel({ fuelConsumption, threshold, onThresholdChange, onThresholdSaved, patchSettings, pricePerLiter }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
@@ -346,6 +346,14 @@ function FuelConsumptionPanel({ fuelConsumption, threshold, onThresholdChange, o
       }, VEHICLE_CLASS_LABELS[cls] || cls))
     ),
     e("div", { className: "totals-row" },
+      e("div", { className: "stat" },
+        e("div", { className: "label" }, "Litros totales consumidos (flota)"),
+        e("div", { className: "value" }, formatNumber(fuelConsumption.fleet_total_liters, 1) + " L")
+      ),
+      pricePerLiter > 0 && e("div", { className: "stat" },
+        e("div", { className: "label" }, "Costo total estimado"),
+        e("div", { className: "value" }, formatMoney(fuelConsumption.fleet_total_liters * pricePerLiter))
+      ),
       selectedClass === "all"
         ? classEntries.map(([cls, avg]) => e("div", { className: "stat", key: cls },
             e("div", { className: "label" }, "Promedio " + (VEHICLE_CLASS_LABELS[cls] || cls)),
@@ -1005,7 +1013,11 @@ function App({ api, database }) {
             ? e(React.Fragment, null,
                 e(IdlingCostPanel, { idlingCost: data.idling_cost, onFuelPriceApplied: handleFuelPriceApplied, onIdleRatesSaved: handleSettingsSaved, patchSettings }),
                 e(IdleEfficiencyPanel, { idlingCost: data.idling_cost }),
-                e(FuelConsumptionPanel, { fuelConsumption: data.fuel_consumption, threshold, onThresholdChange: setThreshold, onThresholdSaved: handleSettingsSaved, patchSettings })
+                e(FuelConsumptionPanel, {
+                  fuelConsumption: data.fuel_consumption, threshold, onThresholdChange: setThreshold,
+                  onThresholdSaved: handleSettingsSaved, patchSettings,
+                  pricePerLiter: data.idling_cost.price_per_liter || 0,
+                })
               )
             : e("div", { className: "panel" },
                 e("h2", null, "Costo de ralentí y consumo de combustible"),
