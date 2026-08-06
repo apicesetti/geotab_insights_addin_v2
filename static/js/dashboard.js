@@ -91,30 +91,34 @@ async function fetchGroupTree(api) {
   return buildGroupTree(groups);
 }
 
-// {device_id: litros} a partir de un diagnóstico contador acumulado (StatusData),
-// 1 llamada por vehículo (chunked) en vez de por evento/registro: mucho más
-// liviano para flotas grandes cerca del límite de requests. Usado tanto para
-// ralentí (IDLE_FUEL_STATUS_DIAGNOSTIC_ID) como para combustible total
-// (TOTAL_FUEL_STATUS_DIAGNOSTIC_ID) cuando FuelUsed no está disponible.
+// {device_id: litros} a partir de un diagnóstico contador acumulado (StatusData).
+// Usado tanto para ralentí (IDLE_FUEL_STATUS_DIAGNOSTIC_ID) como para combustible
+// total (TOTAL_FUEL_STATUS_DIAGNOSTIC_ID) cuando FuelUsed no está disponible.
 // weekWindows: si se pasa, además arma la serie semanal de flota (litros por
 // semana, sumando el delta de cada vehículo dentro de esa semana) para las
 // proyecciones -- devuelve { byDevice, weekly }.
-async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodStart, periodEnd, weekWindows) {
-  const deviceIdsList = Object.keys(devicesById);
-  const statusCalls = deviceIdsList.map(deviceId => ["Get", {
-    typeName: "StatusData",
-    search: {
-      fromDate: periodStart.toISOString(), toDate: periodEnd.toISOString(),
-      diagnosticSearch: { id: diagnosticId },
-      deviceSearch: { id: deviceId },
-    },
-  }]);
+//
+// OJO: esto antes era un Get() sin resultsLimit, 1 llamada por vehículo -- mismo
+// problema que ya se documentó arriba para FuelUsed: estos diagnósticos se
+// muestrean muy seguido (cada pocos segundos/minutos de ralentí), así que en
+// períodos largos el Get() truncaba en silencio y el registro más alto del
+// período (el que define el "max" del delta) a veces quedaba afuera de la
+// respuesta, subestimando el consumo real sin que se note. fetchFeedRecords
+// pagina con GetFeed hasta agotar el backlog, igual que Trip/ExceptionEvent,
+// así que no trunca -- y de paso es 1 sola llamada para toda la flota (scopeada
+// por diagnóstico) en vez de 1 por vehículo.
+async function fetchFuelDiagnosticDelta(api, database, devicesById, diagnosticId, periodStart, periodEnd, weekWindows) {
+  const records = await fetchFeedRecords(
+    api, database, "StatusData", "dateTime", periodStart,
+    { key: diagnosticId, search: { diagnosticSearch: { id: diagnosticId } } }
+  );
+  const from = periodStart.toISOString(), to = periodEnd.toISOString();
   const statusRecordsByDevice = {};
-  const callChunks = chunked(statusCalls, FUEL_MULTICALL_CHUNK_SIZE);
-  const deviceChunks = chunked(deviceIdsList, FUEL_MULTICALL_CHUNK_SIZE);
-  for (let c = 0; c < callChunks.length; c++) {
-    const chunkResults = await api.multiCall(callChunks[c]);
-    deviceChunks[c].forEach((deviceId, i) => { statusRecordsByDevice[deviceId] = chunkResults[i] || []; });
+  for (const r of records) {
+    if (!r.dateTime || r.dateTime < from || r.dateTime >= to) continue;
+    const deviceId = (r.device || {}).id;
+    if (!deviceId || devicesById[deviceId] === undefined) continue;
+    (statusRecordsByDevice[deviceId] = statusRecordsByDevice[deviceId] || []).push(r);
   }
   const byDevice = computeFuelDeltaFromStatusData(statusRecordsByDevice);
   const weekly = weekWindows ? computeWeeklyFuelDeltaFromStatusData(statusRecordsByDevice, weekWindows) : null;
@@ -246,7 +250,7 @@ async function buildDashboardData(api, params) {
   if (noFuelUsedData) {
     try {
       const result = await fetchFuelDiagnosticDelta(
-        api, devicesById, TOTAL_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+        api, database, devicesById, TOTAL_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
       );
       totalFuelByDevice = result.byDevice;
       weeklyFuelLiters = result.weekly;
@@ -262,7 +266,7 @@ async function buildDashboardData(api, params) {
   if (idleFuelMethod === "status_data") {
     try {
       const result = await fetchFuelDiagnosticDelta(
-        api, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+        api, database, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
       );
       idleFuelByDevice = result.byDevice;
       weeklyIdleLiters = result.weekly;
@@ -310,7 +314,7 @@ async function buildDashboardData(api, params) {
     if (idlingEvents.length > 0 && Object.keys(idleFuelByDevice).length === 0) {
       try {
         const result = await fetchFuelDiagnosticDelta(
-          api, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+          api, database, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
         );
         idleFuelByDevice = result.byDevice;
         weeklyIdleLiters = result.weekly;
