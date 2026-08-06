@@ -69,43 +69,44 @@ function sumByWeek(records, weekWindows, dateField, valueField) {
   });
 }
 
-// statusRecordsByDevice: {device_id: [StatusData record, ...]} de un diagnóstico
+// startValues/endValues: {device_id: valor}, snapshots de un diagnóstico
 // contador acumulado (IDLE_FUEL_STATUS_DIAGNOSTIC_ID o TOTAL_FUEL_STATUS_DIAGNOSTIC_ID)
-// en el período. Es un contador acumulado desde la instalación del dispositivo,
-// así que los litros reales usados en el período son max(data) - min(data) por
-// vehículo. Misma forma de salida que sumFuelUsedByDevice: {device_id: litros}.
-function computeFuelDeltaFromStatusData(statusRecordsByDevice) {
+// al inicio y al fin de un período (fetchFuelDiagnosticSnapshot en dashboard.js).
+// Es un contador acumulado desde la instalación del dispositivo, así que los
+// litros reales usados en el período son endValue - startValue por vehículo.
+// Sólo se incluyen vehículos con snapshot en ambos extremos -- sin eso no hay
+// delta confiable y el vehículo cae al estimado por horas en computeIdlingCost.
+// Un delta negativo (contador reseteado entre ambos snapshots, ej. reemplazo
+// de dispositivo) se descarta en vez de reportarse como litros negativos.
+// Misma forma de salida que sumFuelUsedByDevice: {device_id: litros}.
+function computeFuelDeltaFromSnapshots(startValues, endValues) {
   const deltas = {};
-  for (const [deviceId, records] of Object.entries(statusRecordsByDevice)) {
-    const values = records.map(r => r.data).filter(v => v != null).map(Number);
-    if (values.length >= 2) {
-      deltas[deviceId] = Math.max(...values) - Math.min(...values);
-    }
+  for (const [deviceId, endValue] of Object.entries(endValues)) {
+    const startValue = startValues[deviceId];
+    if (startValue == null) continue;
+    const delta = endValue - startValue;
+    if (delta >= 0) deltas[deviceId] = delta;
   }
   return deltas;
 }
 
-// Misma fuente (statusRecordsByDevice) que computeFuelDeltaFromStatusData,
-// pero agrupada en el delta de flota (todos los vehículos) por semana en vez
-// del delta total por vehículo: array paralelo a weekWindows con los litros
-// consumidos esa semana. weekWindows: [[weekStart, weekEnd], ...] (Date).
-function computeWeeklyFuelDeltaFromStatusData(statusRecordsByDevice, weekWindows) {
-  return weekWindows.map(([weekStart, weekEnd]) => {
-    const from = weekStart.toISOString(), to = weekEnd.toISOString();
-    let total = 0;
-    for (const records of Object.values(statusRecordsByDevice)) {
-      const values = records
-        .filter(r => r.dateTime && r.dateTime >= from && r.dateTime < to)
-        .map(r => r.data).filter(v => v != null).map(Number);
-      if (values.length >= 2) total += Math.max(...values) - Math.min(...values);
-    }
-    return total;
-  });
+// snapshotsByBoundary: array paralelo a los N+1 bordes de weekWindows (N
+// semanas) -- snapshotsByBoundary[i] es {device_id: valor} en ese borde
+// (fetchFuelDiagnosticSnapshot en dashboard.js, uno por borde de semana).
+// Devuelve un array de N litros: el delta de flota semana a semana, para la
+// serie usada por las proyecciones.
+function computeWeeklyFuelDeltaFromSnapshots(snapshotsByBoundary) {
+  const weekly = [];
+  for (let i = 0; i < snapshotsByBoundary.length - 1; i++) {
+    const deltas = computeFuelDeltaFromSnapshots(snapshotsByBoundary[i], snapshotsByBoundary[i + 1]);
+    weekly.push(Object.values(deltas).reduce((s, l) => s + l, 0));
+  }
+  return weekly;
 }
 
 // exceptionsAll: lista plana de ExceptionEvent (todas las semanas juntas).
 // idleFuelDeltas: {device_id: litros}, de FuelUsed por evento de ralentí o del
-//   diagnóstico acumulado DiagnosticDeviceTotalIdleFuelId (computeFuelDeltaFromStatusData).
+//   diagnóstico acumulado DiagnosticDeviceTotalIdleFuelId (computeFuelDeltaFromSnapshots).
 //   Si un vehículo no tiene entrada acá, no hay medición de ralentí vía diagnosticId
 //   y su consumo se estima por horas en vez de medirse.
 // vehicleClassByDevice: {device_id: 'pesados'|'livianos'|'otros'}.
