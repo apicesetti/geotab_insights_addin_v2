@@ -385,7 +385,7 @@ function FuelConsumptionPanel({ fuelConsumption, threshold, onThresholdChange, o
             e(SortableTh, { label: "Distancia", sortKey: "total_distance_km", sort, onSort }),
             e(SortableTh, { label: "Litros", sortKey: "total_liters", sort, onSort })
           )),
-          e("tbody", null, visibleVehicles.map(v => e("tr", { key: v.device_id, className: Math.abs(v.deviation_pct) >= threshold ? "outlier" : "" },
+          e("tbody", null, visibleVehicles.map(v => e("tr", { key: v.device_id, className: v.deviation_pct > 0 && v.deviation_pct >= threshold ? "outlier" : "" },
             e("td", null, v.device_name),
             e("td", null, VEHICLE_CLASS_LABELS[v.vehicle_class] || v.vehicle_class),
             e("td", { className: "num" }, formatNumber(v.l_per_100km, 2)),
