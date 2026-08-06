@@ -295,6 +295,7 @@ async function buildDashboardData(api, params) {
     // Por evento de ralentí en vez de agregado: cada llamada a FuelUsed cuenta contra el
     // límite de la API, así que con muchos eventos esto puede agotarse a mitad de camino.
     // Se procesa chunk a chunk para quedarnos con lo que se llegó a traer.
+    const idleEventDeviceIds = new Set();
     try {
       const idleCalls = [];
       const idleCallDevices = [];
@@ -304,6 +305,7 @@ async function buildDashboardData(api, params) {
         const activeFrom = ev.activeFrom;
         const activeTo = ev.activeTo;
         if (!deviceId || !activeFrom || !activeTo) continue;
+        idleEventDeviceIds.add(deviceId);
         idleCalls.push(["Get", { typeName: "FuelUsed", search: { deviceSearch: { id: deviceId }, fromDate: activeFrom, toDate: activeTo } }]);
         idleCallDevices.push(deviceId);
         idleCallWeekIdx.push(weekIndexForIso(weekWindows, activeFrom));
@@ -326,16 +328,27 @@ async function buildDashboardData(api, params) {
       // No se pudo medir combustible de ralentí por evento en esta base.
     }
 
-    // Igual que con el combustible total: si hubo eventos de ralentí pero
-    // FuelUsed no devolvió nada para ninguno (base sin telemetría de motor),
-    // se cae automáticamente al diagnóstico contador acumulado.
-    if (idlingEvents.length > 0 && Object.keys(idleFuelByDevice).length === 0) {
+    // FuelUsed es Geotab calculándolo a partir de telemetría de motor (RPM,
+    // carga, etc.) por vehículo: en flotas mixtas hay vehículos que la
+    // reportan y otros que no, y para estos últimos totalFuelUsed viene
+    // siempre en 0 aunque haya habido ralentí real. Antes esto se resolvía a
+    // nivel flota (si ALGÚN vehículo daba >0 en el fleet, el resto se quedaba
+    // con su 0 en vez de caer al diagnóstico) -- ahora se evalúa vehículo por
+    // vehículo: cada uno que tuvo eventos de ralentí pero terminó en 0 cae
+    // individualmente al diagnóstico contador acumulado.
+    const noFuelUsedDevices = {};
+    for (const deviceId of idleEventDeviceIds) {
+      if (!(idleFuelByDevice[deviceId] > 0)) noFuelUsedDevices[deviceId] = devicesById[deviceId];
+    }
+    if (Object.keys(noFuelUsedDevices).length > 0) {
       try {
         const result = await fetchFuelDiagnosticDelta(
-          api, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+          api, noFuelUsedDevices, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
         );
-        idleFuelByDevice = result.byDevice;
-        weeklyIdleLiters = result.weekly;
+        for (const [deviceId, liters] of Object.entries(result.byDevice)) {
+          idleFuelByDevice[deviceId] = liters;
+        }
+        if (result.weekly) result.weekly.forEach((liters, i) => { weeklyIdleLiters[i] += liters; });
       } catch (err) {
         // Diagnóstico tampoco disponible en esta base.
       }
