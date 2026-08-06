@@ -17,7 +17,7 @@ const RULE_CATEGORY_WEIGHTS = {
   colision_frontal: 1.6, frotado_ojos: 1.3, fatiga: 1.5,
   bostezo: 1.3, salida_carril: 1.4,
 };
-const EFFICIENCY_IDLE_PENALTY_FACTOR = 2;
+const EFFICIENCY_IDLE_PENALTY_FACTOR = 1;
 const TREND_CHANGE_THRESHOLD_PCT = 10;
 
 function startOfUtcDay(date) {
