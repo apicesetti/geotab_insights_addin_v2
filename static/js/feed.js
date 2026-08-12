@@ -288,7 +288,7 @@ async function fetchFeedRecords(api, database, typeName, dateField, requestedFro
   return getAllRecords(db, feedKey);
 }
 
-// GetFeed no aplica acá a propósito: se usa Get con fetchGetRangeRecursive
+// GetFeed no aplica acá a propósito: se usa Get con fetchGetPaginated
 // (utils.js), sin deviceSearch -- nunca 1 llamada por vehículo. TTL corto en
 // vez de cache indefinido: el rango pedido normalmente incluye "hoy", cuyos
 // trips todavía pueden estar llegando durante el día, así que no conviene
@@ -306,7 +306,7 @@ async function fetchTripRecords(api, database, fromDate, toDate) {
   const cached = await getRangeCache(db, key);
   if (cached && Date.now() - cached.fetchedAt < RANGE_CACHE_TTL_MS) return cached.records;
 
-  const records = await fetchGetRangeRecursive(api, "Trip", null, fromDate, toDate, 0);
+  const records = await fetchGetPaginated(api, "Trip", null, fromDate, toDate);
   await putRangeCache(db, key, records);
   return records;
 }

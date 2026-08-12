@@ -163,13 +163,11 @@ async function fetchFuelDiagnosticSnapshot(api, deviceIdsList, diagnosticId, atD
 }
 
 // {device_id: [{dateTime, data}, ...]} de un diagnóstico para toda la flota
-// en el período. fetchGetRangeRecursive (utils.js) hace 1 sola llamada Get
-// sin deviceSearch para todo el rango -- devuelve los registros de todos los
-// vehículos juntos, sin multiCall ni 1 llamada por vehículo -- partiendo el
-// rango de fechas al medio solo si hace falta (respuesta al tope de
-// resultsLimit, posible truncamiento).
+// en el período. fetchGetPaginated (utils.js) pagina Get con sort/offset/
+// lastId sin deviceSearch para todo el rango -- devuelve los registros de
+// todos los vehículos juntos, sin multiCall ni 1 llamada por vehículo.
 async function fetchFuelDiagnosticRange(api, diagnosticId, periodStart, periodEnd) {
-  const records = await fetchGetRangeRecursive(api, "StatusData", { diagnosticSearch: { id: diagnosticId } }, periodStart, periodEnd, 0);
+  const records = await fetchGetPaginated(api, "StatusData", { diagnosticSearch: { id: diagnosticId } }, periodStart, periodEnd);
   const seriesByDevice = {};
   for (const r of records) {
     const deviceId = (r.device || {}).id;

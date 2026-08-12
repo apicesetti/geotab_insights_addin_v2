@@ -22,30 +22,33 @@ const GET_RANGE_RESULTS_LIMIT = 50000;
 // campos fijos de búsqueda además de fromDate/toDate (ej. diagnosticSearch
 // para StatusData); null/undefined si no hace falta ninguno.
 //
-// Get no tiene cursor de continuación como GetFeed, así que si la respuesta
-// viene justo al tope de resultsLimit (posible truncamiento) se parte el
-// rango de fechas al medio y se pide cada mitad por separado (recursivo, en
-// paralelo) hasta que cada pedazo entre completo. El costo real termina
-// dependiendo de cuánto volumen haya de verdad en el rango pedido -- si
-// entra en 1 llamada, es 1 llamada; si no, se adapta solo.
-async function fetchGetRangeRecursive(api, typeName, extraSearch, fromDate, toDate, depth) {
-  const records = await api.call("Get", {
-    typeName,
-    resultsLimit: GET_RANGE_RESULTS_LIMIT,
-    search: { ...(extraSearch || {}), fromDate: fromDate.toISOString(), toDate: toDate.toISOString() },
-  });
-  if (records.length < GET_RANGE_RESULTS_LIMIT) return records;
-  const midMs = fromDate.getTime() + (toDate.getTime() - fromDate.getTime()) / 2;
-  // Tope de profundidad / rango ya no partible en dos mitades distintas: nos
-  // quedamos con lo que hay en vez de recursar sin fin (caso extremo, no
-  // debería pasar en la práctica salvo un volumen de datos por segundo).
-  if ((depth || 0) >= 12 || midMs <= fromDate.getTime() || midMs >= toDate.getTime()) return records;
-  const mid = new Date(midMs);
-  const [left, right] = await Promise.all([
-    fetchGetRangeRecursive(api, typeName, extraSearch, fromDate, mid, (depth || 0) + 1),
-    fetchGetRangeRecursive(api, typeName, extraSearch, mid, toDate, (depth || 0) + 1),
-  ]);
-  return left.concat(right);
+// Pagina con sort + offset + lastId, como indica la guía oficial de Geotab
+// ("Pagination and Sorting", Guides > Concepts) -- NO comparando
+// records.length contra resultsLimit: la misma guía advierte explícitamente
+// que "resultsLimit truncates a response; by itself, it does not prove that
+// the complete result was returned" -- una página puede volver con MENOS del
+// límite pedido y aun así no ser todo. La única señal confiable de "no hay
+// más" es que una página vuelva vacía. Se ordena por "id" (campo único en
+// cualquier entidad de Geotab) en vez de por un campo de fecha específico,
+// para no tener que adivinar cómo se llama ese campo en cada typeName.
+async function fetchGetPaginated(api, typeName, extraSearch, fromDate, toDate) {
+  const out = [];
+  let offset = null;
+  let lastId = null;
+  while (true) {
+    const page = await api.call("Get", {
+      typeName,
+      resultsLimit: GET_RANGE_RESULTS_LIMIT,
+      search: { ...(extraSearch || {}), fromDate: fromDate.toISOString(), toDate: toDate.toISOString() },
+      sort: { sortBy: "id", sortDirection: "asc", offset, lastId },
+    });
+    if (!page || !page.length) break;
+    out.push(...page);
+    const last = page[page.length - 1];
+    offset = last.id;
+    lastId = last.id;
+  }
+  return out;
 }
 
 // Reintentos con backoff exponencial + jitter, como recomienda la guía de
