@@ -22,12 +22,17 @@
 
 const FEED_DB_NAME = "geotab_insights_feed_cache";
 const FEED_DB_VERSION = 1;
-// null = no se manda resultsLimit: Geotab aplica su propio máximo por tipo de
-// entidad ("type-specific overrides"), que puede ser mayor al que nosotros
-// adivinaríamos a mano -- y como drainFeed ya no depende de este número para
-// saber cuándo cortar (ver abajo), no hace falta fijarlo.
-const FEED_RESULTS_LIMIT = null;
+// Confirmado contra la API real: sin resultsLimit explícito, Geotab devuelve
+// páginas chicas por default (12, 4 registros...) en vez de su máximo real --
+// omitirlo NO destraba un tope mayor, al revés de lo que asumíamos antes. Se
+// pide explícito el máximo real de Get/GetFeed (50000, confirmado para Trip)
+// para que, cuando SÍ hay backlog grande, entre en menos llamadas. drainFeed
+// igual no depende de este número para saber cuándo cortar (corta por página
+// vacía, ver abajo) -- así que si algún tipo tiene un tope real menor a este,
+// Geotab lo va a aplicar igual sin que rompa nada acá.
+const FEED_RESULTS_LIMIT = 50000;
 const FEED_MAX_AGE_DAYS = 400; // poda: no tiene sentido guardar más que el rango más amplio que se pueda pedir desde la UI
+const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // no podar (scan completo del feed) más de 1 vez por día
 
 // GetFeed tiene su propio límite de tasa en MyGeotab, aparte del resto de la
 // API: 60 llamadas por minuto (con overrides según el tipo de entidad). Con
@@ -87,10 +92,19 @@ function getCursor(db, feedKey) {
   });
 }
 
-function putCursor(db, feedKey, toVersion, earliestSeeded) {
+// lastPrunedAt: cuándo se corrió pruneOldRecords por última vez para este
+// feed (null si nunca) -- se guarda acá para no tener que podar (scan
+// completo del feed) en cada "Analizar", ver PRUNE_INTERVAL_MS más abajo.
+// Los callers que no tocan la poda pasan el valor ya existente (cursor.lastPrunedAt)
+// para no perderlo: put() reemplaza el registro entero, no lo mergea.
+function putCursor(db, feedKey, toVersion, earliestSeeded, lastPrunedAt) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction("cursors", "readwrite");
-    tx.objectStore("cursors").put({ feedKey, toVersion, earliestSeeded, updatedAt: new Date().toISOString() });
+    tx.objectStore("cursors").put({
+      feedKey, toVersion, earliestSeeded,
+      lastPrunedAt: lastPrunedAt || null,
+      updatedAt: new Date().toISOString(),
+    });
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -120,16 +134,15 @@ function putRecords(db, feedKey, dateField, records) {
   });
 }
 
+// getAll() en vez de cursor manual (openCursor + continue() registro por
+// registro): para un feed grande (ej. Trip de una flota de miles de
+// vehículos, cientos de miles de registros cacheados) getAll() es una sola
+// operación bulk en vez de N round-trips async, uno por registro.
 function getAllRecords(db, feedKey) {
   return new Promise((resolve, reject) => {
     const idx = db.transaction("records", "readonly").objectStore("records").index("by_feed");
-    const out = [];
-    const req = idx.openCursor(IDBKeyRange.only(feedKey));
-    req.onsuccess = ev => {
-      const cur = ev.target.result;
-      if (cur) { out.push(cur.value.data); cur.continue(); }
-      else resolve(out);
-    };
+    const req = idx.getAll(IDBKeyRange.only(feedKey));
+    req.onsuccess = () => resolve(req.result.map(r => r.data));
     req.onerror = () => reject(req.error);
   });
 }
@@ -191,7 +204,7 @@ async function fetchFeedRecords(api, database, typeName, dateField, requestedFro
   try {
     if (!cursor) {
       const toVersion = await drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, requestedFromIso, null);
-      await putCursor(db, feedKey, toVersion, requestedFromIso);
+      await putCursor(db, feedKey, toVersion, requestedFromIso, null);
     } else {
       let earliestSeeded = cursor.earliestSeeded;
       if (requestedFromIso < earliestSeeded) {
@@ -204,7 +217,8 @@ async function fetchFeedRecords(api, database, typeName, dateField, requestedFro
         earliestSeeded = requestedFromIso;
       }
       const toVersion = await drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, null, cursor.toVersion);
-      await putCursor(db, feedKey, toVersion, earliestSeeded);
+      // lastPrunedAt no se toca acá: se preserva el que ya tenía el cursor.
+      await putCursor(db, feedKey, toVersion, earliestSeeded, cursor.lastPrunedAt);
     }
   } catch (err) {
     // fromVersion vencido/inválido u otro error de feed: se descarta el
@@ -214,17 +228,26 @@ async function fetchFeedRecords(api, database, typeName, dateField, requestedFro
     throw err;
   }
 
-  // Poda todo lo más viejo que FEED_MAX_AGE_DAYS, pero nunca por debajo de lo
-  // recién pedido (evitaría borrar datos que el propio caller sigue necesitando).
-  const maxAgeCutoff = new Date(Date.now() - FEED_MAX_AGE_DAYS * 86400000).toISOString();
-  const pruneCutoff = maxAgeCutoff < requestedFromIso ? maxAgeCutoff : requestedFromIso;
-  await pruneOldRecords(db, feedKey, pruneCutoff);
-  // Si se podó más allá de lo que earliestSeeded promete, hay que correr esa
-  // marca para adelante: si no, un pedido futuro por ese rango creería que ya
-  // está cacheado cuando en realidad se acaba de borrar.
-  const cursorAfterPrune = await getCursor(db, feedKey);
-  if (cursorAfterPrune && pruneCutoff > cursorAfterPrune.earliestSeeded) {
-    await putCursor(db, feedKey, cursorAfterPrune.toVersion, pruneCutoff);
+  // Podar es un recorrido completo del feed (pruneOldRecords cursorea TODOS
+  // sus registros para chequear la fecha de cada uno): no tiene sentido
+  // pagarlo en cada "Analizar" si ya se podó hace poco. Antes se corría
+  // siempre, sumando un scan completo de IndexedDB en cada click aunque no
+  // hubiera nada para borrar -- con un feed grande (ej. Trip de una flota
+  // grande) esto era buena parte de la demora.
+  const cursorNow = await getCursor(db, feedKey);
+  const shouldPrune = cursorNow && (!cursorNow.lastPrunedAt
+    || Date.now() - new Date(cursorNow.lastPrunedAt).getTime() >= PRUNE_INTERVAL_MS);
+  if (shouldPrune) {
+    // Poda todo lo más viejo que FEED_MAX_AGE_DAYS, pero nunca por debajo de
+    // lo recién pedido (evitaría borrar datos que el propio caller sigue necesitando).
+    const maxAgeCutoff = new Date(Date.now() - FEED_MAX_AGE_DAYS * 86400000).toISOString();
+    const pruneCutoff = maxAgeCutoff < requestedFromIso ? maxAgeCutoff : requestedFromIso;
+    await pruneOldRecords(db, feedKey, pruneCutoff);
+    // Si se podó más allá de lo que earliestSeeded promete, hay que correr esa
+    // marca para adelante: si no, un pedido futuro por ese rango creería que ya
+    // está cacheado cuando en realidad se acaba de borrar.
+    const earliestSeeded = pruneCutoff > cursorNow.earliestSeeded ? pruneCutoff : cursorNow.earliestSeeded;
+    await putCursor(db, feedKey, cursorNow.toVersion, earliestSeeded, new Date().toISOString());
   }
 
   return getAllRecords(db, feedKey);
