@@ -253,6 +253,22 @@ async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodSt
     fetchFuelDiagnosticRange(api, deviceIdsList, diagnosticId, periodStart, periodEnd),
   ]);
 
+  // Si el snapshot puntual de periodStart vino vacío para algún vehículo (su
+  // historial de este diagnóstico no llega tan atrás, o Geotab no resuelve
+  // "último valor conocido" más allá de cierta ventana), NO lo descartamos:
+  // computeFuelDeltaFromSnapshots exige un valor de arranque para cada
+  // vehículo, así que un solo vehículo sin snapshot en periodStart no debería
+  // tirar abajo el cálculo -- pero tampoco queremos perder al vehículo. Se usa
+  // el primer registro que sí tenemos dentro del rango ya traído como
+  // arranque: subestima apenas ese vehículo puntual (no ve consumo anterior a
+  // ese primer registro), pero es mejor que perder el vehículo entero -- y
+  // mucho mejor que perder LA FLOTA ENTERA si esto le pasa a todos.
+  for (const [deviceId, records] of Object.entries(seriesByDevice)) {
+    if (firstSnapshot[deviceId] == null && records.length) {
+      firstSnapshot[deviceId] = Number(records[0].data);
+    }
+  }
+
   const restBoundaries = boundaries.slice(1);
   const restSnapshots = restBoundaries.map(atDate => snapshotFromSeriesAt(seriesByDevice, atDate.toISOString()));
 
@@ -413,7 +429,13 @@ async function buildDashboardData(api, params) {
     }
   }
 
-  const idleFuelMethod = fuelCfg.idle_fuel_method || "fuel_used_per_event";
+  // El método por evento (fuel_used_per_event) depende de FuelUsed: en bases
+  // sin FuelUsed (noFuelUsedData) siempre daría vacío/estimado por horas,
+  // aunque el diagnóstico contador de ralentí sí tenga datos -- por eso el
+  // default automático cae a status_data en ese caso. Sigue siendo overrideable
+  // vía fuelCfg.idle_fuel_method si algún cliente lo necesita distinto (no hay
+  // UI para setearlo todavía, solo vía config/localStorage directo).
+  const idleFuelMethod = fuelCfg.idle_fuel_method || (noFuelUsedData ? "status_data" : "fuel_used_per_event");
   let idleFuelByDevice = {};
   let weeklyIdleLiters = new Array(weekWindows.length).fill(0);
 
