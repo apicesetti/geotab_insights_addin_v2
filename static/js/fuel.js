@@ -1,21 +1,19 @@
 // Costo de ralentí y detección de outliers de consumo de combustible,
-// cruzando ExceptionEvent (RuleIdlingId) y FuelUsed por vehículo.
+// cruzando ExceptionEvent (RuleIdlingId) con los diagnósticos contador
+// acumulado de combustible (dashboard.js: fetchFuelDiagnosticDelta).
 // Port 1:1 de core/fuel.py. Depende de durationToHours (metrics.js) y round (utils.js).
 
 const IDLING_RULE_ID = "RuleIdlingId";
 
 // Diagnóstico de StatusData con el combustible total consumido en ralentí
-// desde la instalación del dispositivo (contador acumulado). Alternativa a
-// sumar FuelUsed por cada evento de ralentí: 1 llamada por vehículo en vez de
-// 1 por evento, mucho más liviano para flotas grandes cerca del límite de requests.
+// desde la instalación del dispositivo (contador acumulado). No se usa
+// FuelUsed (dato calculado por Geotab a partir de telemetría de motor, RPM/
+// carga): es poco confiable entre vehículos/bases distintas (queda vacío/en 0
+// cuando el vehículo no reporta esa telemetría, aunque el consumo real sí se
+// mida vía este diagnóstico) -- este diagnóstico es la única fuente ahora.
 const IDLE_FUEL_STATUS_DIAGNOSTIC_ID = "DiagnosticDeviceTotalIdleFuelId";
 
-// Mismo patrón que IDLE_FUEL_STATUS_DIAGNOSTIC_ID pero para el combustible
-// total (no solo ralentí): contador acumulado desde la instalación del
-// dispositivo. FuelUsed es un dato calculado por Geotab a partir de la
-// telemetría de motor (RPM, carga, etc.); en bases donde el vehículo no
-// reporta esa telemetría, FuelUsed queda vacío/en 0 para todos los vehículos
-// aunque el consumo real sí se mida vía este diagnóstico.
+// Mismo patrón que IDLE_FUEL_STATUS_DIAGNOSTIC_ID pero para el combustible total.
 const TOTAL_FUEL_STATUS_DIAGNOSTIC_ID = "DiagnosticDeviceTotalFuelId";
 
 // Comparar consumo contra un único promedio de flota penaliza a los vehículos pesados
@@ -41,34 +39,6 @@ function classifyVehicleClass(deviceGroups, groupNamesById) {
   return "otros";
 }
 
-// Registros FuelUsed -> {device_id: suma del campo indicado en el período}.
-function sumFuelUsedByDevice(records, field) {
-  field = field || "totalFuelUsed";
-  const totals = {};
-  for (const r of records) {
-    const deviceId = (r.device || {}).id;
-    if (!deviceId) continue;
-    totals[deviceId] = (totals[deviceId] || 0) + (parseFloat(r[field]) || 0.0);
-  }
-  return totals;
-}
-
-// Registros con una fecha ISO (dateField) y un valor numérico (valueField) ->
-// array paralelo a weekWindows con la suma de valueField en cada semana.
-// Usado para armar la serie semanal de flota que alimenta las proyecciones
-// (fuel.js/dashboard.js) a partir de FuelUsed (fromDate/totalFuelUsed).
-function sumByWeek(records, weekWindows, dateField, valueField) {
-  return weekWindows.map(([weekStart, weekEnd]) => {
-    const from = weekStart.toISOString(), to = weekEnd.toISOString();
-    let total = 0;
-    for (const r of records) {
-      const d = r[dateField];
-      if (d && d >= from && d < to) total += parseFloat(r[valueField]) || 0.0;
-    }
-    return total;
-  });
-}
-
 // startValues/endValues: {device_id: valor}, snapshots de un diagnóstico
 // contador acumulado (IDLE_FUEL_STATUS_DIAGNOSTIC_ID o TOTAL_FUEL_STATUS_DIAGNOSTIC_ID)
 // al inicio y al fin de un período (fetchFuelDiagnosticSnapshot en dashboard.js).
@@ -78,7 +48,7 @@ function sumByWeek(records, weekWindows, dateField, valueField) {
 // delta confiable y el vehículo cae al estimado por horas en computeIdlingCost.
 // Un delta negativo (contador reseteado entre ambos snapshots, ej. reemplazo
 // de dispositivo) se descarta en vez de reportarse como litros negativos.
-// Misma forma de salida que sumFuelUsedByDevice: {device_id: litros}.
+// Forma de salida: {device_id: litros}.
 function computeFuelDeltaFromSnapshots(startValues, endValues) {
   const deltas = {};
   for (const [deviceId, endValue] of Object.entries(endValues)) {
@@ -105,8 +75,8 @@ function computeWeeklyFuelDeltaFromSnapshots(snapshotsByBoundary) {
 }
 
 // exceptionsAll: lista plana de ExceptionEvent (todas las semanas juntas).
-// idleFuelDeltas: {device_id: litros}, de FuelUsed por evento de ralentí o del
-//   diagnóstico acumulado DiagnosticDeviceTotalIdleFuelId (computeFuelDeltaFromSnapshots).
+// idleFuelDeltas: {device_id: litros}, del diagnóstico acumulado
+//   DiagnosticDeviceTotalIdleFuelId (computeFuelDeltaFromSnapshots).
 //   Si un vehículo no tiene entrada acá, no hay medición de ralentí vía diagnosticId
 //   y su consumo se estima por horas en vez de medirse.
 // vehicleClassByDevice: {device_id: 'pesados'|'livianos'|'otros'}.
@@ -222,7 +192,8 @@ function avgLPer100km(rows) {
   return totalKm > 0 ? (totalL / totalKm) * 100.0 : 0.0;
 }
 
-// fuelDeltas: {device_id: litros}, de sumFuelUsedByDevice sobre FuelUsed.
+// fuelDeltas: {device_id: litros}, del diagnóstico DiagnosticDeviceTotalFuelId
+//   (computeFuelDeltaFromSnapshots, vía fetchFuelDiagnosticDelta en dashboard.js).
 // distanceByDevice: {device_id: km recorridos en el período}.
 // vehicleClassByDevice: {device_id: 'pesados'|'livianos'|'otros'}, de classifyVehicleClass.
 // El desvío de cada vehículo se calcula contra el promedio de SU clase (no el de toda

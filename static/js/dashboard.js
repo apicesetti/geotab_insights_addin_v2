@@ -102,9 +102,9 @@ function buildWeekWindowsForRange(fromDate, toDate) {
 }
 
 // Índice de weekWindows al que pertenece una fecha ISO, o -1 si cae fuera de
-// rango. Usado para acumular series semanales (combustible/ralentí) a partir
-// de registros individuales (FuelUsed por evento) en vez de un feed que ya
-// venga separado por semana.
+// rango. Usado por computeWeeklyEstimatedIdleLiters (fuel.js) para acumular
+// por semana la parte de ralentí estimada por horas (vehículos sin medición
+// real vía diagnóstico), a partir de ExceptionEvent individuales.
 function weekIndexForIso(weekWindows, iso) {
   if (!iso) return -1;
   for (let i = 0; i < weekWindows.length; i++) {
@@ -163,50 +163,57 @@ async function fetchFuelDiagnosticSnapshot(api, deviceIdsList, diagnosticId, atD
 }
 
 // resultsLimit máximo real de Get (confirmado en la referencia de Geotab
-// para StatusData). A diferencia del snapshot puntual (1 registro por
-// vehículo), acá SÍ hay riesgo de truncamiento real si algún vehículo tiene
-// más de este número de registros del diagnóstico en todo el período --
-// se detecta por separado (ver truncatedDeviceIds) en vez de asumir que la
-// serie está completa.
+// para StatusData).
 const DIAGNOSTIC_RANGE_RESULTS_LIMIT = 50000;
 
-// {device_id: [{dateTime, data}, ...]} de un diagnóstico, para toda la flota,
-// en 1 sola ronda de multiCall (chunked) -- 1 Get por vehículo pidiendo el
-// rango completo [periodStart, periodEnd] en vez de 1 ronda de multiCall POR
-// CADA borde de semana como hacía antes fetchFuelDiagnosticDelta (con 12
-// semanas eso baja de 13 rondas a 1). La idea es traer el historial completo
-// del contador una sola vez y derivar el valor "a la fecha" de cada borde en
-// memoria (snapshotFromSeriesAt), en vez de pedirle a Geotab ese cálculo por
-// separado para cada borde.
-async function fetchFuelDiagnosticRange(api, deviceIdsList, diagnosticId, periodStart, periodEnd) {
-  const calls = deviceIdsList.map(deviceId => ["Get", {
+// A diferencia del snapshot puntual (fromDate == toDate, que solo resuelve
+// con deviceSearch), un rango real de fechas SÍ funciona sin deviceSearch:
+// devuelve los registros de TODOS los vehículos juntos en la respuesta, así
+// que no hace falta multiCall ni 1 llamada por vehículo para esto -- 1 sola
+// llamada Get cubre la flota entera.
+//
+// Sigue habiendo riesgo de truncamiento (Get no tiene cursor de continuación
+// como GetFeed): si la respuesta viene justo al tope de resultsLimit, se
+// parte el rango de fechas al medio y se pide cada mitad por separado
+// (recursivo, en paralelo) hasta que cada pedazo entre completo. Así el
+// costo real depende de cuánto muestrea este diagnóstico en esta base -- si
+// entra en 1 llamada, es 1 llamada; si no, se adapta solo.
+async function fetchStatusDataRange(api, diagnosticId, fromDate, toDate, depth) {
+  const records = await api.call("Get", {
     typeName: "StatusData",
     resultsLimit: DIAGNOSTIC_RANGE_RESULTS_LIMIT,
     search: {
-      fromDate: periodStart.toISOString(), toDate: periodEnd.toISOString(),
+      fromDate: fromDate.toISOString(), toDate: toDate.toISOString(),
       diagnosticSearch: { id: diagnosticId },
-      deviceSearch: { id: deviceId },
     },
-  }]);
+  });
+  if (records.length < DIAGNOSTIC_RANGE_RESULTS_LIMIT) return records;
+  const midMs = fromDate.getTime() + (toDate.getTime() - fromDate.getTime()) / 2;
+  // Tope de profundidad / rango ya no partible en dos mitades distintas: nos
+  // quedamos con lo que hay en vez de recursar sin fin (caso extremo, no
+  // debería pasar en la práctica salvo un diagnóstico muestreado por segundo).
+  if ((depth || 0) >= 12 || midMs <= fromDate.getTime() || midMs >= toDate.getTime()) return records;
+  const mid = new Date(midMs);
+  const [left, right] = await Promise.all([
+    fetchStatusDataRange(api, diagnosticId, fromDate, mid, (depth || 0) + 1),
+    fetchStatusDataRange(api, diagnosticId, mid, toDate, (depth || 0) + 1),
+  ]);
+  return left.concat(right);
+}
+
+// {device_id: [{dateTime, data}, ...]} de un diagnóstico para toda la flota
+// en el período, agrupando y ordenando por dateTime el resultado plano de
+// fetchStatusDataRange.
+async function fetchFuelDiagnosticRange(api, diagnosticId, periodStart, periodEnd) {
+  const records = await fetchStatusDataRange(api, diagnosticId, periodStart, periodEnd, 0);
   const seriesByDevice = {};
-  const truncatedDeviceIds = [];
-  const callChunks = chunked(calls, FUEL_MULTICALL_CHUNK_SIZE);
-  const deviceChunks = chunked(deviceIdsList, FUEL_MULTICALL_CHUNK_SIZE);
-  for (let c = 0; c < callChunks.length; c++) {
-    const chunkResults = await callMultiCall(api, callChunks[c]);
-    deviceChunks[c].forEach((deviceId, i) => {
-      const records = chunkResults[i] || [];
-      if (records.length >= DIAGNOSTIC_RANGE_RESULTS_LIMIT) {
-        // Diagnóstico muestreado muy seguido para este vehículo puntual: no
-        // confiamos en una serie que puede estar cortada a mitad de camino.
-        truncatedDeviceIds.push(deviceId);
-        return;
-      }
-      const valid = records.filter(r => r.data != null && r.dateTime);
-      if (valid.length) seriesByDevice[deviceId] = valid.sort((a, b) => (a.dateTime < b.dateTime ? -1 : 1));
-    });
+  for (const r of records) {
+    const deviceId = (r.device || {}).id;
+    if (!deviceId || r.data == null || !r.dateTime) continue;
+    (seriesByDevice[deviceId] = seriesByDevice[deviceId] || []).push(r);
   }
-  return { seriesByDevice, truncatedDeviceIds };
+  for (const list of Object.values(seriesByDevice)) list.sort((a, b) => (a.dateTime < b.dateTime ? -1 : 1));
+  return seriesByDevice;
 }
 
 // Último valor conocido a atIso ("snapshot"), buscado en memoria sobre una
@@ -231,7 +238,7 @@ function snapshotFromSeriesAt(seriesByDevice, atIso) {
 // sin el riesgo de truncamiento silencioso de Geotab en diagnósticos de
 // muestreo muy frecuente (fuel total, idle fuel). Usado tanto para ralentí
 // (IDLE_FUEL_STATUS_DIAGNOSTIC_ID) como para combustible total
-// (TOTAL_FUEL_STATUS_DIAGNOSTIC_ID) cuando FuelUsed no está disponible.
+// (TOTAL_FUEL_STATUS_DIAGNOSTIC_ID) -- única fuente de combustible, no se usa FuelUsed.
 // weekWindows: si se pasa, además arma la serie semanal de flota (litros por
 // semana) para las proyecciones -- devuelve { byDevice, weekly }.
 async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodStart, periodEnd, weekWindows) {
@@ -240,18 +247,25 @@ async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodSt
     ? [weekWindows[0][0], ...weekWindows.map(([, weekEnd]) => weekEnd)]
     : [periodStart, periodEnd];
 
-  // El primer borde (arranque del período) necesita el snapshot puntual real:
-  // Geotab lo resuelve buscando el último valor conocido SIN importar cuánto
-  // tiempo atrás haya sido, y fetchFuelDiagnosticRange solo trae registros
-  // desde periodStart en adelante -- no alcanza para reconstruirlo en
-  // memoria. Los demás bordes (fin de cada semana, incluido el fin del
-  // período) caen todos DENTRO de ese rango, así que esos sí se derivan ahí.
-  // Las dos rondas de multiCall comparten la misma cuota (callMultiCall) y
-  // pueden ir en simultáneo sin perder el control de la ventana.
-  const [firstSnapshot, { seriesByDevice, truncatedDeviceIds }] = await Promise.all([
+  // El primer borde (arranque del período) necesita el snapshot puntual real
+  // (fromDate == toDate solo resuelve "último valor conocido" con
+  // deviceSearch -- sigue siendo 1 Get por vehículo vía multiCall). El resto
+  // del rango (fin de cada semana, incluido el fin del período) se trae en 1
+  // sola tanda SIN deviceSearch -- a diferencia del snapshot puntual, un
+  // rango real sí devuelve todos los vehículos juntos, así que no hace falta
+  // multiCall para esto.
+  const [firstSnapshot, seriesByDeviceRaw] = await Promise.all([
     fetchFuelDiagnosticSnapshot(api, deviceIdsList, diagnosticId, boundaries[0]),
-    fetchFuelDiagnosticRange(api, deviceIdsList, diagnosticId, periodStart, periodEnd),
+    fetchFuelDiagnosticRange(api, diagnosticId, periodStart, periodEnd),
   ]);
+
+  // fetchFuelDiagnosticRange no está scopeada por device (no tiene forma de
+  // estarlo sin multiCall): puede traer vehículos fuera del filtro de grupo
+  // elegido en la UI, así que se filtra acá contra devicesById.
+  const seriesByDevice = {};
+  for (const [deviceId, records] of Object.entries(seriesByDeviceRaw)) {
+    if (devicesById[deviceId] !== undefined) seriesByDevice[deviceId] = records;
+  }
 
   // Si el snapshot puntual de periodStart vino vacío para algún vehículo (su
   // historial de este diagnóstico no llega tan atrás, o Geotab no resuelve
@@ -271,16 +285,6 @@ async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodSt
 
   const restBoundaries = boundaries.slice(1);
   const restSnapshots = restBoundaries.map(atDate => snapshotFromSeriesAt(seriesByDevice, atDate.toISOString()));
-
-  if (truncatedDeviceIds.length) {
-    // Vehículos con serie truncada: se resuelven aparte con el método de
-    // snapshot puntual por borde (más caro, pero son la excepción y no el
-    // caso general -- la mayoría de la flota ya se resolvió en 1 sola ronda).
-    const fallback = await Promise.all(
-      restBoundaries.map(atDate => fetchFuelDiagnosticSnapshot(api, truncatedDeviceIds, diagnosticId, atDate))
-    );
-    fallback.forEach((extra, i) => Object.assign(restSnapshots[i], extra));
-  }
 
   const snapshots = [firstSnapshot, ...restSnapshots];
   const byDevice = computeFuelDeltaFromSnapshots(snapshots[0], snapshots[snapshots.length - 1]);
@@ -384,137 +388,32 @@ async function buildDashboardData(api, params) {
   const periodStart = weekWindows[0][0];
   const periodEnd = weekWindows[weekWindows.length - 1][1];
 
+  // Ya no se usa la entidad FuelUsed (dato calculado por Geotab a partir de
+  // telemetría de motor, poco confiable entre vehículos/bases distintas):
+  // combustible total y ralentí salen siempre de los diagnósticos contador
+  // acumulado (StatusData), vía fetchFuelDiagnosticDelta.
   let totalFuelByDevice = {};
   let weeklyFuelLiters = new Array(weekWindows.length).fill(0);
-  // Se guarda fuera del try (scope de toda buildDashboardData) porque el
-  // bloque de combustible de ralentí más abajo lo reusa para correlacionar
-  // contra los eventos de ralentí en memoria, sin pedir FuelUsed de nuevo.
-  let fuelUsedData = [];
   try {
-    // OJO: antes esto era un Get() sin resultsLimit por TODO el período y
-    // TODA la flota de una sola vez -- Geotab trunca en silencio si hay más
-    // registros de los que entran en la respuesta default (no tira error),
-    // así que en flotas/rangos grandes esto subestimaba el combustible real
-    // sin que se note. fetchFeedRecords pagina con GetFeed hasta agotar el
-    // backlog, igual que Trip/ExceptionEvent, así que no trunca. Es un feed
-    // global (no scopeado por grupo) -- el filtro de grupo se aplica igual
-    // que en Trip, con el devicesById de más abajo.
-    const allFuelUsed = await fetchFeedRecords(api, database, "FuelUsed", "fromDate", periodStart);
-    fuelUsedData = allFuelUsed.filter(r => r.fromDate && r.fromDate < periodEnd.toISOString());
-    const summed = sumFuelUsedByDevice(fuelUsedData, "totalFuelUsed");
-    totalFuelByDevice = Object.fromEntries(Object.entries(summed).filter(([d]) => devicesById[d] !== undefined));
-    weeklyFuelLiters = sumByWeek(fuelUsedData, weekWindows, "fromDate", "totalFuelUsed");
+    const result = await fetchFuelDiagnosticDelta(
+      api, devicesById, TOTAL_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+    );
+    totalFuelByDevice = result.byDevice;
+    weeklyFuelLiters = result.weekly;
   } catch (err) {
-    // FuelUsed no disponible en esta base de datos: seguimos sin datos de combustible.
+    // Diagnóstico no disponible en esta base de datos: seguimos sin datos de combustible.
   }
 
-  // FuelUsed es un valor que Geotab calcula a partir de telemetría de motor
-  // (RPM, carga, etc.). En bases donde el vehículo no reporta esa telemetría,
-  // el feed viene vacío o en 0 para toda la flota aunque el consumo real sí
-  // se mida vía el diagnóstico contador TOTAL_FUEL_STATUS_DIAGNOSTIC_ID (mismo
-  // caso que ya existía para el ralentí). Se usa como fallback automático,
-  // no como método por defecto, para no sumarle una llamada por vehículo a
-  // las bases donde FuelUsed ya funciona.
-  const noFuelUsedData = Object.keys(totalFuelByDevice).length === 0
-    || Object.values(totalFuelByDevice).every(l => l <= 0);
-  if (noFuelUsedData) {
-    try {
-      const result = await fetchFuelDiagnosticDelta(
-        api, devicesById, TOTAL_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
-      );
-      totalFuelByDevice = result.byDevice;
-      weeklyFuelLiters = result.weekly;
-    } catch (err) {
-      // Diagnóstico tampoco disponible en esta base: seguimos sin datos de combustible.
-    }
-  }
-
-  // El método por evento (fuel_used_per_event) depende de FuelUsed: en bases
-  // sin FuelUsed (noFuelUsedData) siempre daría vacío/estimado por horas,
-  // aunque el diagnóstico contador de ralentí sí tenga datos -- por eso el
-  // default automático cae a status_data en ese caso. Sigue siendo overrideable
-  // vía fuelCfg.idle_fuel_method si algún cliente lo necesita distinto (no hay
-  // UI para setearlo todavía, solo vía config/localStorage directo).
-  const idleFuelMethod = fuelCfg.idle_fuel_method || (noFuelUsedData ? "status_data" : "fuel_used_per_event");
   let idleFuelByDevice = {};
   let weeklyIdleLiters = new Array(weekWindows.length).fill(0);
-
-  if (idleFuelMethod === "status_data") {
-    try {
-      const result = await fetchFuelDiagnosticDelta(
-        api, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
-      );
-      idleFuelByDevice = result.byDevice;
-      weeklyIdleLiters = result.weekly;
-    } catch (err) {
-      // Diagnóstico no disponible en esta base de datos.
-    }
-  } else {
-    // Por evento de ralentí en vez de agregado, pero SIN pedir nada de nuevo a
-    // la API: antes esto era 1 llamada Get por evento (fromDate/toDate = la
-    // ventana exacta del evento), agrupadas en multiCall -- con miles de
-    // eventos de ralentí por mes (flotas grandes, muchos km) esas sub-calls
-    // solas superaban la cuota de multiCall (1500/min), aparte de ser lento.
-    //
-    // fuelUsedData ya tiene TODOS los registros de FuelUsed de la flota en el
-    // período (se trajo una sola vez más arriba, vía GetFeed, para el total
-    // de combustible). Cada registro trae su propio fromDate -- el mismo
-    // campo que Geotab usaba para filtrar server-side cuando pedíamos por
-    // evento -- así que replicamos ese filtro (fromDate dentro de la ventana
-    // del evento) en memoria sobre lo que ya tenemos, sin ninguna llamada
-    // adicional. totalIdlingFuelUsedL es un valor fijo por registro: no
-    // cambia según cómo se lo pida, así que el resultado es idéntico al de
-    // antes, evento por evento.
-    const idleEventDeviceIds = new Set();
-    const fuelUsedByDevice = new Map();
-    for (const r of fuelUsedData) {
-      const deviceId = (r.device || {}).id;
-      if (!deviceId || !r.fromDate) continue;
-      if (!fuelUsedByDevice.has(deviceId)) fuelUsedByDevice.set(deviceId, []);
-      fuelUsedByDevice.get(deviceId).push(r);
-    }
-    for (const ev of idlingEvents) {
-      const deviceId = (ev.device || {}).id;
-      const activeFrom = ev.activeFrom;
-      const activeTo = ev.activeTo;
-      if (!deviceId || !activeFrom || !activeTo) continue;
-      idleEventDeviceIds.add(deviceId);
-      const deviceRecords = fuelUsedByDevice.get(deviceId);
-      if (!deviceRecords) continue;
-      const weekIdx = weekIndexForIso(weekWindows, activeFrom);
-      for (const r of deviceRecords) {
-        if (r.fromDate < activeFrom || r.fromDate >= activeTo) continue;
-        const liters = parseFloat(r.totalIdlingFuelUsedL != null ? r.totalIdlingFuelUsedL : r.totalFuelUsed) || 0;
-        idleFuelByDevice[deviceId] = (idleFuelByDevice[deviceId] || 0) + liters;
-        if (weekIdx >= 0) weeklyIdleLiters[weekIdx] += liters;
-      }
-    }
-
-    // FuelUsed es Geotab calculándolo a partir de telemetría de motor (RPM,
-    // carga, etc.) por vehículo: en flotas mixtas hay vehículos que la
-    // reportan y otros que no, y para estos últimos totalFuelUsed viene
-    // siempre en 0 aunque haya habido ralentí real. Antes esto se resolvía a
-    // nivel flota (si ALGÚN vehículo daba >0 en el fleet, el resto se quedaba
-    // con su 0 en vez de caer al diagnóstico) -- ahora se evalúa vehículo por
-    // vehículo: cada uno que tuvo eventos de ralentí pero terminó en 0 cae
-    // individualmente al diagnóstico contador acumulado.
-    const noFuelUsedDevices = {};
-    for (const deviceId of idleEventDeviceIds) {
-      if (!(idleFuelByDevice[deviceId] > 0)) noFuelUsedDevices[deviceId] = devicesById[deviceId];
-    }
-    if (Object.keys(noFuelUsedDevices).length > 0) {
-      try {
-        const result = await fetchFuelDiagnosticDelta(
-          api, noFuelUsedDevices, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
-        );
-        for (const [deviceId, liters] of Object.entries(result.byDevice)) {
-          idleFuelByDevice[deviceId] = liters;
-        }
-        if (result.weekly) result.weekly.forEach((liters, i) => { weeklyIdleLiters[i] += liters; });
-      } catch (err) {
-        // Diagnóstico tampoco disponible en esta base.
-      }
-    }
+  try {
+    const result = await fetchFuelDiagnosticDelta(
+      api, devicesById, IDLE_FUEL_STATUS_DIAGNOSTIC_ID, periodStart, periodEnd, weekWindows
+    );
+    idleFuelByDevice = result.byDevice;
+    weeklyIdleLiters = result.weekly;
+  } catch (err) {
+    // Diagnóstico no disponible en esta base de datos.
   }
 
   const fuelDataAvailable = Object.keys(totalFuelByDevice).length > 0 || Object.keys(idleFuelByDevice).length > 0;
@@ -537,7 +436,7 @@ async function buildDashboardData(api, params) {
       : null;
   }
 
-  // weeklyIdleLiters hasta acá solo tiene litros medidos (FuelUsed/diagnosticId);
+  // weeklyIdleLiters hasta acá solo tiene litros medidos vía diagnóstico;
   // le suma la parte estimada por horas de los vehículos sin medición real, para
   // que la serie semanal (y su proyección) coincida con el total que ya muestra
   // el panel de "Costo de ralentí" (computeIdlingCost).

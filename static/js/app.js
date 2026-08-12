@@ -887,6 +887,7 @@ function App({ api, database }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState("resumen");
+  const runIdRef = useRef(0);
 
   function patchSettings(patch) {
     return updateDbSettings(database, settings, patch).then(newSettings => {
@@ -902,7 +903,16 @@ function App({ api, database }) {
   // settingsOverride: si viene (justo después de guardar un ajuste), se usa
   // tal cual en vez del estado de React, para no pisarse con un guardado que
   // todavía no terminó de propagarse al estado.
+  //
+  // runIdRef: buildDashboardData no se puede cancelar de verdad (el SDK de
+  // Add-Ins no expone AbortController; los GetFeed/multiCall en vuelo van a
+  // terminar de todos modos), pero si se dispara un runAnalysis nuevo antes
+  // de que termine uno viejo (doble click, o guardar un ajuste mientras el
+  // anterior seguía en curso) el viejo no debe pisar el resultado del nuevo
+  // al resolver después. Cada corrida se marca con un id; si cuando termina
+  // ya no es la más reciente, se descarta en silencio.
   async function runAnalysis(showSpinner, settingsOverride) {
+    const runId = ++runIdRef.current;
     if (showSpinner) setLoading(true);
     setError(null);
     try {
@@ -914,12 +924,14 @@ function App({ api, database }) {
         groupFilterId: effective.group_filter_id,
         dbSettings: effective,
       });
+      if (runId !== runIdRef.current) return;
       setData(d);
       setThreshold(d.fuel_consumption.outlier_threshold_pct);
     } catch (err) {
+      if (runId !== runIdRef.current) return;
       setError(err.message || "Error consultando el dashboard.");
     } finally {
-      setLoading(false);
+      if (runId === runIdRef.current) setLoading(false);
     }
   }
 
@@ -975,7 +987,11 @@ function App({ api, database }) {
         e("button", {
           className: "analyze-btn",
           onClick: () => runAnalysis(true),
-          disabled: !canAnalyze,
+          // loading acá evita el re-entry más común (doble click / click
+          // mientras el anterior sigue en curso); runIdRef (runAnalysis)
+          // cubre el resto de los casos (ej. guardar un ajuste dispara su
+          // propio runAnalysis sin pasar por este botón).
+          disabled: !canAnalyze || loading,
         }, data ? "Actualizar" : "Analizar")
       )
     ),
@@ -1021,7 +1037,7 @@ function App({ api, database }) {
               )
             : e("div", { className: "panel" },
                 e("h2", null, "Costo de ralentí y consumo de combustible"),
-                e("div", { className: "info-box" }, "Este cliente no reporta datos de combustible en MyGeotab (objeto FuelUsed no disponible).")
+                e("div", { className: "info-box" }, "Este cliente no reporta datos de combustible en MyGeotab (diagnósticos de combustible no disponibles).")
               )
         ),
 
