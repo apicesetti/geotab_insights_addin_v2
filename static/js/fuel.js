@@ -41,7 +41,7 @@ function classifyVehicleClass(deviceGroups, groupNamesById) {
 
 // startValues/endValues: {device_id: valor}, snapshots de un diagnóstico
 // contador acumulado (IDLE_FUEL_STATUS_DIAGNOSTIC_ID o TOTAL_FUEL_STATUS_DIAGNOSTIC_ID)
-// al inicio y al fin de un período (fetchFuelDiagnosticSnapshot en dashboard.js).
+// al inicio y al fin de un período (snapshotFromSeriesAt en dashboard.js).
 // Es un contador acumulado desde la instalación del dispositivo, así que los
 // litros reales usados en el período son endValue - startValue por vehículo.
 // Sólo se incluyen vehículos con snapshot en ambos extremos -- sin eso no hay
@@ -62,7 +62,7 @@ function computeFuelDeltaFromSnapshots(startValues, endValues) {
 
 // snapshotsByBoundary: array paralelo a los N+1 bordes de weekWindows (N
 // semanas) -- snapshotsByBoundary[i] es {device_id: valor} en ese borde
-// (fetchFuelDiagnosticSnapshot en dashboard.js, uno por borde de semana).
+// (snapshotFromSeriesAt en dashboard.js, uno por borde de semana).
 // Devuelve un array de N litros: el delta de flota semana a semana, para la
 // serie usada por las proyecciones.
 function computeWeeklyFuelDeltaFromSnapshots(snapshotsByBoundary) {

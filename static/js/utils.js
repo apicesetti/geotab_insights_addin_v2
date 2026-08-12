@@ -7,12 +7,6 @@ function round(value, decimals) {
   return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
-function chunked(items, size) {
-  const out = [];
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-  return out;
-}
-
 // resultsLimit máximo real de Get, confirmado contra la API (StatusData, Trip).
 const GET_RANGE_RESULTS_LIMIT = 50000;
 
