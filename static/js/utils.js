@@ -7,6 +7,12 @@ function round(value, decimals) {
   return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
+function chunked(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 // Reintentos con backoff exponencial + jitter, como recomienda la guía de
 // integraciones de Geotab ante rate limiting/errores transitorios ("Retry a
 // bounded number of times with exponential backoff and jitter"). No hay forma
