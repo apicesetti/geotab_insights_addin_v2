@@ -22,7 +22,7 @@ const GET_RANGE_RESULTS_LIMIT = 50000;
 // campos fijos de búsqueda además de fromDate/toDate (ej. diagnosticSearch
 // para StatusData); null/undefined si no hace falta ninguno.
 //
-// Pagina con sort + offset + lastId, como indica la guía oficial de Geotab
+// Pagina con sort + offset, como indica la guía oficial de Geotab
 // ("Pagination and Sorting", Guides > Concepts) -- NO comparando
 // records.length contra resultsLimit: la misma guía advierte explícitamente
 // que "resultsLimit truncates a response; by itself, it does not prove that
@@ -30,23 +30,23 @@ const GET_RANGE_RESULTS_LIMIT = 50000;
 // límite pedido y aun así no ser todo. La única señal confiable de "no hay
 // más" es que una página vuelva vacía. Se ordena por "id" (campo único en
 // cualquier entidad de Geotab) en vez de por un campo de fecha específico,
-// para no tener que adivinar cómo se llama ese campo en cada typeName.
+// para no tener que adivinar cómo se llama ese campo en cada typeName --
+// lastId es solo para desambiguar campos NO únicos (ej. date/name); con "id"
+// (ya único de por sí) Geotab lo rechaza directamente ("Last id can not be
+// used with sort by id").
 async function fetchGetPaginated(api, typeName, extraSearch, fromDate, toDate) {
   const out = [];
   let offset = null;
-  let lastId = null;
   while (true) {
     const page = await api.call("Get", {
       typeName,
       resultsLimit: GET_RANGE_RESULTS_LIMIT,
       search: { ...(extraSearch || {}), fromDate: fromDate.toISOString(), toDate: toDate.toISOString() },
-      sort: { sortBy: "id", sortDirection: "asc", offset, lastId },
+      sort: { sortBy: "id", sortDirection: "asc", offset },
     });
     if (!page || !page.length) break;
     out.push(...page);
-    const last = page[page.length - 1];
-    offset = last.id;
-    lastId = last.id;
+    offset = page[page.length - 1].id;
   }
   return out;
 }
