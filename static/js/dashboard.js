@@ -162,50 +162,14 @@ async function fetchFuelDiagnosticSnapshot(api, deviceIdsList, diagnosticId, atD
   return values;
 }
 
-// resultsLimit máximo real de Get (confirmado en la referencia de Geotab
-// para StatusData).
-const DIAGNOSTIC_RANGE_RESULTS_LIMIT = 50000;
-
-// A diferencia del snapshot puntual (fromDate == toDate, que solo resuelve
-// con deviceSearch), un rango real de fechas SÍ funciona sin deviceSearch:
-// devuelve los registros de TODOS los vehículos juntos en la respuesta, así
-// que no hace falta multiCall ni 1 llamada por vehículo para esto -- 1 sola
-// llamada Get cubre la flota entera.
-//
-// Sigue habiendo riesgo de truncamiento (Get no tiene cursor de continuación
-// como GetFeed): si la respuesta viene justo al tope de resultsLimit, se
-// parte el rango de fechas al medio y se pide cada mitad por separado
-// (recursivo, en paralelo) hasta que cada pedazo entre completo. Así el
-// costo real depende de cuánto muestrea este diagnóstico en esta base -- si
-// entra en 1 llamada, es 1 llamada; si no, se adapta solo.
-async function fetchStatusDataRange(api, diagnosticId, fromDate, toDate, depth) {
-  const records = await api.call("Get", {
-    typeName: "StatusData",
-    resultsLimit: DIAGNOSTIC_RANGE_RESULTS_LIMIT,
-    search: {
-      fromDate: fromDate.toISOString(), toDate: toDate.toISOString(),
-      diagnosticSearch: { id: diagnosticId },
-    },
-  });
-  if (records.length < DIAGNOSTIC_RANGE_RESULTS_LIMIT) return records;
-  const midMs = fromDate.getTime() + (toDate.getTime() - fromDate.getTime()) / 2;
-  // Tope de profundidad / rango ya no partible en dos mitades distintas: nos
-  // quedamos con lo que hay en vez de recursar sin fin (caso extremo, no
-  // debería pasar en la práctica salvo un diagnóstico muestreado por segundo).
-  if ((depth || 0) >= 12 || midMs <= fromDate.getTime() || midMs >= toDate.getTime()) return records;
-  const mid = new Date(midMs);
-  const [left, right] = await Promise.all([
-    fetchStatusDataRange(api, diagnosticId, fromDate, mid, (depth || 0) + 1),
-    fetchStatusDataRange(api, diagnosticId, mid, toDate, (depth || 0) + 1),
-  ]);
-  return left.concat(right);
-}
-
 // {device_id: [{dateTime, data}, ...]} de un diagnóstico para toda la flota
-// en el período, agrupando y ordenando por dateTime el resultado plano de
-// fetchStatusDataRange.
+// en el período. fetchGetRangeRecursive (utils.js) hace 1 sola llamada Get
+// sin deviceSearch para todo el rango -- devuelve los registros de todos los
+// vehículos juntos, sin multiCall ni 1 llamada por vehículo -- partiendo el
+// rango de fechas al medio solo si hace falta (respuesta al tope de
+// resultsLimit, posible truncamiento).
 async function fetchFuelDiagnosticRange(api, diagnosticId, periodStart, periodEnd) {
-  const records = await fetchStatusDataRange(api, diagnosticId, periodStart, periodEnd, 0);
+  const records = await fetchGetRangeRecursive(api, "StatusData", { diagnosticSearch: { id: diagnosticId } }, periodStart, periodEnd, 0);
   const seriesByDevice = {};
   for (const r of records) {
     const deviceId = (r.device || {}).id;
@@ -328,22 +292,26 @@ async function buildDashboardData(api, params) {
 
   const weekWindows = buildWeekWindowsForRange(fromDate, toDate);
 
-  // Trip y ExceptionEvent ya no se piden por semana con Get() (repetía todo
-  // el rango de nuevo en cada "Analizar"/"Actualizar"): se mantienen en un
-  // feed incremental por base de datos vía GetFeed, cacheado en IndexedDB
-  // (ver feed.js). Trip es un feed global, sin scope de grupo -- por eso el
-  // filtro por dispositivo de abajo ya no es solo backstop, es el único
+  // Trip: Get por rango de fechas (fetchTripRecords en feed.js), sin
+  // deviceSearch -- nunca 1 llamada por vehículo, Geotab devuelve los
+  // registros de toda la flota juntos. Cacheado por rango exacto con TTL
+  // corto (evita repetir la llamada si se re-analiza el mismo rango poco
+  // después), pero sin cursor incremental: un rango de fechas distinto
+  // siempre se vuelve a pedir completo. Es global, sin scope de grupo -- por
+  // eso el filtro por dispositivo de abajo no es solo backstop, es el único
   // lugar donde se aplica el filtro de grupo.
   //
-  // ExceptionEvent se pide un feed por cada regla mapeada (ruleSearch),
-  // no uno global: sin esto se trae cada evento de excepción de la flota
-  // entera (incluidas reglas no mapeadas), que son la mayoría del volumen y
-  // se descartan igual más abajo por ruleMapping. Se agrega también la regla
+  // ExceptionEvent sigue en GetFeed (sí tiene sentido el cursor incremental
+  // acá: no cambia de rango de fechas entre corridas, solo de reglas
+  // mapeadas). Se pide un feed por cada regla mapeada (ruleSearch), no uno
+  // global: sin esto se trae cada evento de excepción de la flota entera
+  // (incluidas reglas no mapeadas), que son la mayoría del volumen y se
+  // descartan igual más abajo por ruleMapping. Se agrega también la regla
   // built-in de ralentí de Geotab (IDLING_RULE_ID) aunque no esté tildada en
   // "Configurar": el costo de ralentí la usa siempre (ver más abajo).
   const exceptionRuleIds = new Set([...Object.keys(ruleMapping), IDLING_RULE_ID]);
   const [allTrips, exceptionsByRuleFeed] = await Promise.all([
-    fetchFeedRecords(api, database, "Trip", "start", fromDate),
+    fetchTripRecords(api, database, fromDate, toDate),
     Promise.all([...exceptionRuleIds].map(ruleId => fetchFeedRecords(
       api, database, "ExceptionEvent", "activeFrom", fromDate,
       { key: ruleId, search: { ruleSearch: { id: ruleId } } }

@@ -1,27 +1,32 @@
-// Caché local de Trip / ExceptionEvent vía GetFeed, en vez de re-pedir el
-// rango de fechas completo con Get() semana a semana en cada "Analizar"
-// (dashboard.js hacía eso: N llamadas por consulta, siempre desde cero).
+// Caché local de datos de MyGeotab en IndexedDB, dos estrategias distintas
+// según el tipo:
 //
-// Se mantiene un feed incremental por (base de datos, typeName) en
-// IndexedDB: la primera vez trae el histórico desde la fecha pedida
-// paginando con GetFeed; las siguientes solo piden lo nuevo/modificado
-// desde la versión (fromVersion) guardada, sin importar el rango de fechas.
-// Si después se pide un rango más viejo que el ya sembrado, se hace un único
-// Get puntual solo para el hueco faltante (sin tocar el cursor del feed).
+// ExceptionEvent vía GetFeed (fetchFeedRecords/drainFeed): se mantiene un
+// feed incremental por (base de datos, regla) -- la primera vez trae el
+// histórico desde la fecha pedida paginando con GetFeed; las siguientes solo
+// piden lo nuevo/modificado desde la versión (fromVersion) guardada, sin
+// importar el rango de fechas. Si después se pide un rango más viejo que el
+// ya sembrado, se hace un único Get puntual solo para el hueco faltante (sin
+// tocar el cursor del feed). Se pide un feed separado por cada regla mapeada
+// (ruleSearch, con su propio cursor): sin esto, cada feed trae TODOS los
+// eventos de excepción de la flota (incluidas reglas no mapeadas), que son
+// la mayoría del volumen y se descartan igual client-side.
 //
-// No se scopea por grupo: es un feed global por tipo, así el filtro de
-// grupo elegido en la UI no invalida nada -- se sigue filtrando client-side
-// en dashboard.js, igual que ya hacía de backstop antes de este cambio.
+// Trip vía Get (fetchTripRecords): sin fromVersion no hay forma de pedir
+// "solo lo nuevo", así que cada rango de fechas se pide completo -- pero se
+// cachea en range_cache por rango exacto (ver RANGE_CACHE_TTL_MS), para no
+// repetir la llamada si se re-analiza el mismo rango poco después (ej.
+// "Actualizar" tras guardar un ajuste). Un rango de fechas distinto (ej. un
+// día más tarde, con la ventana rodante corrida) no pega en el cache y se
+// vuelve a pedir completo -- a diferencia de GetFeed, esto no reusa lo ya
+// traído para el solapamiento entre rangos.
 //
-// ExceptionEvent sí se scopea por regla (ruleSearch): sin esto, cada feed
-// trae TODOS los eventos de excepción de la flota (incluidas reglas no
-// mapeadas en "Configurar"), que después se descartan client-side -- son la
-// mayoría del volumen y el motivo por el que las consultas tardaban tanto.
-// Se pide un feed separado por cada regla mapeada (con su propio cursor), así
-// agregar/sacar una regla del mapeo solo afecta el feed de esa regla.
+// Ninguno de los dos se scopea por grupo: son globales por tipo, así el
+// filtro de grupo elegido en la UI no invalida nada -- se sigue filtrando
+// client-side en dashboard.js.
 
 const FEED_DB_NAME = "geotab_insights_feed_cache";
-const FEED_DB_VERSION = 1;
+const FEED_DB_VERSION = 2;
 // Confirmado contra la API real: sin resultsLimit explícito, Geotab devuelve
 // páginas chicas por default (12, 4 registros...) en vez de su máximo real --
 // omitirlo NO destraba un tope mayor, al revés de lo que asumíamos antes. Se
@@ -78,9 +83,38 @@ function openFeedDb() {
       if (!db.objectStoreNames.contains("cursors")) {
         db.createObjectStore("cursors", { keyPath: "feedKey" });
       }
+      // v2: cache simple por rango exacto de fechas (fetchTripRecords), sin
+      // cursor incremental -- Trip ahora se pide con Get en vez de GetFeed
+      // (ver más abajo), así que no hay fromVersion para pedir "solo lo
+      // nuevo"; esto evita repetir la llamada completa si se re-analiza el
+      // mismo rango (ej. "Actualizar" después de guardar un ajuste).
+      if (!db.objectStoreNames.contains("range_cache")) {
+        db.createObjectStore("range_cache", { keyPath: "_key" });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+  });
+}
+
+function rangeCacheKey(database, typeName, fromIso, toIso) {
+  return database + "|" + typeName + "|" + fromIso + "|" + toIso;
+}
+
+function getRangeCache(db, key) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction("range_cache", "readonly").objectStore("range_cache").get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function putRangeCache(db, key, records) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("range_cache", "readwrite");
+    tx.objectStore("range_cache").put({ _key: key, records, fetchedAt: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
   });
 }
 
@@ -190,9 +224,10 @@ async function drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, see
   return version;
 }
 
-// typeName: "Trip" | "ExceptionEvent". dateField: campo de fecha de ese tipo
-// usado para bucketear por semana en dashboard.js ("start" / "activeFrom").
-// scope: opcional, { key, search } -- ej. { key: ruleId, search: { ruleSearch: { id: ruleId } } }
+// typeName: "ExceptionEvent" en la práctica (Trip usa fetchTripRecords, más
+// abajo, no esto). dateField: campo de fecha de ese tipo, usado para
+// bucketear por semana en dashboard.js ("activeFrom"). scope: opcional,
+// { key, search } -- ej. { key: ruleId, search: { ruleSearch: { id: ruleId } } }
 // para pedir el feed de una sola regla en vez del feed global del tipo.
 async function fetchFeedRecords(api, database, typeName, dateField, requestedFromDate, scope) {
   const db = await openFeedDb();
@@ -251,4 +286,27 @@ async function fetchFeedRecords(api, database, typeName, dateField, requestedFro
   }
 
   return getAllRecords(db, feedKey);
+}
+
+// GetFeed no aplica acá a propósito: se usa Get con fetchGetRangeRecursive
+// (utils.js), sin deviceSearch -- nunca 1 llamada por vehículo. TTL corto en
+// vez de cache indefinido: el rango pedido normalmente incluye "hoy", cuyos
+// trips todavía pueden estar llegando durante el día, así que no conviene
+// confiar en una respuesta vieja por mucho tiempo -- pero sí evita repetir
+// la llamada completa si se re-analiza el mismo rango exacto en los minutos
+// siguientes (ej. tras guardar un ajuste, que dispara runAnalysis de nuevo).
+const RANGE_CACHE_TTL_MS = 20 * 60 * 1000;
+
+async function fetchTripRecords(api, database, fromDate, toDate) {
+  const db = await openFeedDb();
+  const fromIso = fromDate.toISOString();
+  const toIso = toDate.toISOString();
+  const key = rangeCacheKey(database, "Trip", fromIso, toIso);
+
+  const cached = await getRangeCache(db, key);
+  if (cached && Date.now() - cached.fetchedAt < RANGE_CACHE_TTL_MS) return cached.records;
+
+  const records = await fetchGetRangeRecursive(api, "Trip", null, fromDate, toDate, 0);
+  await putRangeCache(db, key, records);
+  return records;
 }
