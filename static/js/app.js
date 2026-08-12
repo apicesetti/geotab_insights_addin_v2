@@ -785,7 +785,7 @@ function flattenGroupTree(nodes, depth) {
   return out;
 }
 
-function RuleMappingPanel({ api, config, onChange }) {
+function RuleMappingPanel({ api, database, config, onChange }) {
   const [rules, setRules] = useState([]);
   const [groupTree, setGroupTree] = useState([]);
   const [loadingRules, setLoadingRules] = useState(false);
@@ -793,8 +793,8 @@ function RuleMappingPanel({ api, config, onChange }) {
   useEffect(() => {
     setLoadingRules(true);
     Promise.all([
-      fetchRules(api),
-      fetchGroupTree(api),
+      fetchRules(api, database),
+      fetchGroupTree(api, database),
     ])
       .then(([rulesList, groups]) => {
         setRules(Array.isArray(rulesList) ? rulesList : []);
@@ -980,7 +980,7 @@ function App({ api, database }) {
       )
     ),
     e("main", null,
-      showConfig && e(RuleMappingPanel, { api, config: settings, onChange: updateAnalysisConfig }),
+      showConfig && e(RuleMappingPanel, { api, database, config: settings, onChange: updateAnalysisConfig }),
       error && e("div", { className: "error-box" }, error),
       loading && e("div", { className: "center-msg" }, "Consultando MyGeotab, puede tardar unos segundos..."),
       !data && !loading && !error && settingsLoaded && e("div", { className: "center-msg" }, 'Confirmá las reglas y el grupo a analizar, y hacé click en "Analizar".'),
@@ -1068,7 +1068,10 @@ window.geotab.addin.cesettiInsightsV2 = function () {
       // undefined. Con 2 parámetros siempre llega (credentials, server) por separado.
       api.getSession(function (credentials, server) {
         const database = credentials.database;
-        ReactDOM.createRoot(document.getElementById("root")).render(e(App, { api, database }));
+        // Todas las llamadas de acá para abajo (dashboard.js/feed.js/RuleMappingPanel)
+        // pasan por este wrapper: reintentan solas ante rate limiting/timeouts, ver utils.js.
+        const resilientApi = withApiRetry(api);
+        ReactDOM.createRoot(document.getElementById("root")).render(e(App, { api: resilientApi, database }));
         initializeCallback();
       });
     },

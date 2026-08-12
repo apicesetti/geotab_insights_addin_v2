@@ -6,6 +6,11 @@
 
 const EXCLUDED_SERIAL_NUMBERS = new Set(["", "000-000-0000"]);
 const FUEL_MULTICALL_CHUNK_SIZE = 200;
+// Cuántos chunks de ExecuteMultiCall se mandan en simultáneo. La guía de
+// Geotab pide "a modest number" en vez de todos a la vez -- 4 es un punto
+// intermedio: en una flota de 1300 vehículos (7 chunks de 200) esto baja de 7
+// round-trips en serie a ~2, sin acercarse al volumen que gatilla rate limiting.
+const MULTICALL_CONCURRENCY = 4;
 const WEEKS_DEFAULT = 12;
 
 // Antes vivían en config.json > scoring, compartidas por todas las bases de
@@ -78,16 +83,16 @@ function weekIndexForIso(weekWindows, iso) {
 
 // Reglas disponibles para el panel de mapeo (excluye ZoneStop, que no aporta
 // nada como categoría de infracción).
-async function fetchRules(api) {
-  const rules = await api.call("Get", { typeName: "Rule" });
+async function fetchRules(api, database) {
+  const rules = await cachedGet(api, database, "Rule");
   return rules
     .filter(r => r.id && r.baseType !== "ZoneStop")
     .map(r => ({ id: r.id, name: r.name || r.id }))
     .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase(), "es"));
 }
 
-async function fetchGroupTree(api) {
-  const groups = await api.call("Get", { typeName: "Group" });
+async function fetchGroupTree(api, database) {
+  const groups = await cachedGet(api, database, "Group");
   return buildGroupTree(groups);
 }
 
@@ -109,13 +114,15 @@ async function fetchFuelDiagnosticSnapshot(api, deviceIdsList, diagnosticId, atD
   const values = {};
   const callChunks = chunked(calls, FUEL_MULTICALL_CHUNK_SIZE);
   const deviceChunks = chunked(deviceIdsList, FUEL_MULTICALL_CHUNK_SIZE);
-  for (let c = 0; c < callChunks.length; c++) {
-    const chunkResults = await api.multiCall(callChunks[c]);
+  // Chunks en paralelo (acotado a MULTICALL_CONCURRENCY) en vez de uno por uno
+  // en serie: en flotas grandes esto es la mayor parte del tiempo de espera.
+  const chunkResultsList = await mapWithConcurrency(callChunks, MULTICALL_CONCURRENCY, chunk => api.multiCall(chunk));
+  chunkResultsList.forEach((chunkResults, c) => {
     deviceChunks[c].forEach((deviceId, i) => {
       const rec = (chunkResults[i] || [])[0];
       if (rec && rec.data != null) values[deviceId] = Number(rec.data);
     });
-  }
+  });
   return values;
 }
 
@@ -147,7 +154,10 @@ async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodSt
 async function buildDashboardData(api, params) {
   const { database, fromDate, toDate, ruleMapping, groupFilterId, dbSettings } = params;
 
-  const groups = await api.call("Get", { typeName: "Group" });
+  // Group/Device/Rule cambian poco entre un "Analizar" y el siguiente: se
+  // cachean 12h en localStorage (ver cachedGet en utils.js), como recomienda
+  // la guía de Geotab para catálogos casi-estáticos.
+  const groups = await cachedGet(api, database, "Group");
   const groupsById = {};
   const groupNamesById = {};
   for (const g of groups) {
@@ -158,7 +168,7 @@ async function buildDashboardData(api, params) {
   const scopedGroupIds = groupFilterId ? resolveGroupAndDescendants(groupFilterId, groupsById) : null;
   const groupSearch = scopedGroupIds ? { groups: [...scopedGroupIds].map(id => ({ id })) } : undefined;
 
-  let devices = await api.call("Get", groupSearch ? { typeName: "Device", search: groupSearch } : { typeName: "Device" });
+  let devices = await cachedGet(api, database, "Device", groupSearch);
   devices = devices.filter(d => !EXCLUDED_SERIAL_NUMBERS.has((d.serialNumber || "").trim()));
   if (scopedGroupIds) {
     devices = devices.filter(d => (d.groups || []).some(g => scopedGroupIds.has(typeof g === "object" ? g.id : g)));
@@ -167,7 +177,7 @@ async function buildDashboardData(api, params) {
   for (const d of devices) devicesById[d.id] = d.name || d.id;
   const totalDeviceCount = devices.length;
 
-  const rules = await api.call("Get", { typeName: "Rule" });
+  const rules = await cachedGet(api, database, "Rule");
   const rulesById = {};
   for (const r of rules) rulesById[r.id] = r.name || "";
 
@@ -313,8 +323,13 @@ async function buildDashboardData(api, params) {
       const callChunks = chunked(idleCalls, FUEL_MULTICALL_CHUNK_SIZE);
       const deviceChunks = chunked(idleCallDevices, FUEL_MULTICALL_CHUNK_SIZE);
       const weekIdxChunks = chunked(idleCallWeekIdx, FUEL_MULTICALL_CHUNK_SIZE);
-      for (let c = 0; c < callChunks.length; c++) {
-        const chunkResults = await api.multiCall(callChunks[c]);
+      // Igual que fetchFuelDiagnosticSnapshot pero con mapWithConcurrencySettled:
+      // chunks en paralelo (acotado), mergeando cada uno apenas termina -- si
+      // uno falla a mitad de camino, los que sí terminaron ya quedaron
+      // mergeados (el throw al final solo cae en el catch de abajo, que no
+      // descarta lo ya acumulado). Sigue valiendo "nos quedamos con lo que se
+      // llegó a traer", igual que antes con el for secuencial.
+      await mapWithConcurrencySettled(callChunks, MULTICALL_CONCURRENCY, chunk => api.multiCall(chunk), (chunk, c, chunkResults) => {
         deviceChunks[c].forEach((deviceId, i) => {
           const weekIdx = weekIdxChunks[c][i];
           for (const r of (chunkResults[i] || [])) {
@@ -323,7 +338,7 @@ async function buildDashboardData(api, params) {
             if (weekIdx >= 0) weeklyIdleLiters[weekIdx] += liters;
           }
         });
-      }
+      });
     } catch (err) {
       // No se pudo medir combustible de ralentí por evento en esta base.
     }
