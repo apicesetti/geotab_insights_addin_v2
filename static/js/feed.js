@@ -12,18 +12,26 @@
 // eventos de excepción de la flota (incluidas reglas no mapeadas), que son
 // la mayoría del volumen y se descartan igual client-side.
 //
-// Trip vía Get (fetchTripRecords): sin fromVersion no hay forma de pedir
-// "solo lo nuevo", así que cada rango de fechas se pide completo -- pero se
-// cachea en range_cache por rango exacto (ver RANGE_CACHE_TTL_MS), para no
-// repetir la llamada si se re-analiza el mismo rango poco después (ej.
-// "Actualizar" tras guardar un ajuste). Un rango de fechas distinto (ej. un
-// día más tarde, con la ventana rodante corrida) no pega en el cache y se
-// vuelve a pedir completo -- a diferencia de GetFeed, esto no reusa lo ya
-// traído para el solapamiento entre rangos.
+// Distancia/horas de manejo/ralentí (fetchDeviceActivitySummary) vía
+// GetReportData/DeviceActivitySummary: NO es un método soportado
+// oficialmente por Geotab ("GetReportData is not available or supported
+// using the API", confirmado en la comunidad de Geotab) -- es lo que usa
+// internamente la UI web de reportes. Se usa a propósito, asumiendo que
+// Geotab podría cambiarlo o romperlo sin aviso (la alternativa "soportada",
+// GetReportJson, es aparentemente asíncrona y no se investigó todavía). A
+// cambio, evita traer y sumar cada Trip individual: Geotab ya devuelve la
+// distancia/horas agregadas por vehículo por día.
 //
-// Ninguno de los dos se scopea por grupo: son globales por tipo, así el
-// filtro de grupo elegido en la UI no invalida nada -- se sigue filtrando
-// client-side en dashboard.js.
+// Sin fromVersion no hay forma de pedir "solo lo nuevo", así que cada rango
+// de fechas se pide completo -- pero se cachea en range_cache por rango
+// exacto (ver RANGE_CACHE_TTL_MS), para no repetir la llamada si se
+// re-analiza el mismo rango poco después (ej. "Actualizar" tras guardar un
+// ajuste). Un rango de fechas distinto (ej. un día más tarde, con la
+// ventana rodante corrida) no pega en el cache y se vuelve a pedir completo.
+//
+// Ninguno de los dos (ExceptionEvent, DeviceActivitySummary) se scopea por
+// grupo: son globales, así el filtro de grupo elegido en la UI no invalida
+// nada -- se sigue filtrando client-side en dashboard.js.
 
 const FEED_DB_NAME = "geotab_insights_feed_cache";
 const FEED_DB_VERSION = 2;
@@ -83,9 +91,8 @@ function openFeedDb() {
       if (!db.objectStoreNames.contains("cursors")) {
         db.createObjectStore("cursors", { keyPath: "feedKey" });
       }
-      // v2: cache simple por rango exacto de fechas (fetchTripRecords), sin
-      // cursor incremental -- Trip ahora se pide con Get en vez de GetFeed
-      // (ver más abajo), así que no hay fromVersion para pedir "solo lo
+      // v2: cache simple por rango exacto de fechas (fetchDeviceActivitySummary),
+      // sin cursor incremental -- no hay fromVersion para pedir "solo lo
       // nuevo"; esto evita repetir la llamada completa si se re-analiza el
       // mismo rango (ej. "Actualizar" después de guardar un ajuste).
       if (!db.objectStoreNames.contains("range_cache")) {
@@ -224,8 +231,9 @@ async function drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, see
   return version;
 }
 
-// typeName: "ExceptionEvent" en la práctica (Trip usa fetchTripRecords, más
-// abajo, no esto). dateField: campo de fecha de ese tipo, usado para
+// typeName: "ExceptionEvent" en la práctica (la distancia/horas de manejo
+// usa fetchDeviceActivitySummary, más abajo, no esto). dateField: campo de
+// fecha de ese tipo, usado para
 // bucketear por semana en dashboard.js ("activeFrom"). scope: opcional,
 // { key, search } -- ej. { key: ruleId, search: { ruleSearch: { id: ruleId } } }
 // para pedir el feed de una sola regla en vez del feed global del tipo.
@@ -297,16 +305,36 @@ async function fetchFeedRecords(api, database, typeName, dateField, requestedFro
 // siguientes (ej. tras guardar un ajuste, que dispara runAnalysis de nuevo).
 const RANGE_CACHE_TTL_MS = 20 * 60 * 1000;
 
-async function fetchTripRecords(api, database, fromDate, toDate) {
+// reportSubGroup "Daily" (no "Weekly") a propósito: así el bucketeo por
+// semana lo controla dashboard.js (aggregateActivityByWeek) contra sus
+// propios weekWindows, sin depender de que el agrupamiento semanal interno
+// de Geotab esté alineado a esos mismos límites (lunes UTC).
+//
+// groups: [{id: "GroupCompanyId"}] -- toda la flota, sin scope de grupo (el
+// filtro de grupo elegido en la UI se aplica client-side en dashboard.js,
+// igual que con ExceptionEvent/Trip antes).
+async function fetchDeviceActivitySummary(api, database, fromDate, toDate) {
   const db = await openFeedDb();
-  const fromIso = fromDate.toISOString();
-  const toIso = toDate.toISOString();
-  const key = rangeCacheKey(database, "Trip", fromIso, toIso);
+  const key = rangeCacheKey(database, "DeviceActivitySummary", fromDate.toISOString(), toDate.toISOString());
 
   const cached = await getRangeCache(db, key);
   if (cached && Date.now() - cached.fetchedAt < RANGE_CACHE_TTL_MS) return cached.records;
 
-  const records = await fetchGetPaginated(api, "Trip", null, fromDate, toDate);
+  const rows = await api.call("GetReportData", {
+    argument: {
+      fromUtc: fromDate.toISOString(),
+      toUtc: toDate.toISOString(),
+      devices: [],
+      groupLevel: -1,
+      groups: [{ id: "GroupCompanyId" }],
+      includeHistoricData: false,
+      includeZeroDistanceTrips: false,
+      minCustomerStopDuration: "00:00:00.000",
+      reportArgumentType: "DeviceActivitySummary",
+      reportSubGroup: "Daily",
+    },
+  });
+  const records = rows || [];
   await putRangeCache(db, key, records);
   return records;
 }

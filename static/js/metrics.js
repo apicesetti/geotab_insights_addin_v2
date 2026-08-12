@@ -59,30 +59,23 @@ const SAFETY_EVENT_CATEGORIES = [
 const SAFETY_EVENTS_PER_100KM_FOR_ZERO_SCORE = 5.0;
 
 // week_windows: lista de [week_start, week_end] (Date), ordenada cronológicamente.
-// trips_by_week / exceptions_by_week: listas paralelas de arrays crudos de Trip / ExceptionEvent.
+// weekly_trip_stats: array paralelo a week_windows, cada uno
+//   {total_distance_km, driving_hours, idling_hours, active_devices (Set), active_device_count}
+//   -- viene de aggregateActivityByWeek (dashboard.js), a partir del reporte
+//   DeviceActivitySummary en vez de recorrer cada Trip individual.
+// exceptions_by_week: lista de arrays crudos de ExceptionEvent.
 // rule_mapping: {rule_id: categoria}. Que una regla esté presente ES la señal de que está
 //   incluida en el análisis; eventos de reglas no mapeadas se excluyen (no caen en "otro").
 // category_weights: {categoria: peso}.
-function buildWeeklyMetrics(weekWindows, tripsByWeek, exceptionsByWeek, ruleMapping, categoryWeights) {
+function buildWeeklyMetrics(weekWindows, weeklyTripStats, exceptionsByWeek, ruleMapping, categoryWeights) {
   const weekly = [];
 
   for (let i = 0; i < weekWindows.length; i++) {
     const [weekStart, weekEnd] = weekWindows[i];
-    const trips = tripsByWeek[i] || [];
+    const tripStats = weeklyTripStats[i] || {
+      total_distance_km: 0, driving_hours: 0, idling_hours: 0, active_devices: new Set(), active_device_count: 0,
+    };
     const exceptions = exceptionsByWeek[i] || [];
-
-    let totalDistanceKm = 0.0;
-    let drivingHours = 0.0;
-    let idlingHours = 0.0;
-    const activeDevices = new Set();
-
-    for (const trip of trips) {
-      const deviceId = (trip.device || {}).id;
-      if (deviceId) activeDevices.add(deviceId);
-      totalDistanceKm += parseFloat(trip.distance) || 0.0;
-      drivingHours += durationToHours(trip.drivingDuration);
-      idlingHours += durationToHours(trip.idlingDuration);
-    }
 
     let weightedExceptions = 0.0;
     const exceptionsByCategory = {};
@@ -102,11 +95,11 @@ function buildWeeklyMetrics(weekWindows, tripsByWeek, exceptionsByWeek, ruleMapp
     weekly.push({
       week_start: weekStart.toISOString(),
       week_end: weekEnd.toISOString(),
-      total_distance_km: round(totalDistanceKm, 1),
-      driving_hours: round(drivingHours, 1),
-      idling_hours: round(idlingHours, 1),
-      active_devices: activeDevices,
-      active_device_count: activeDevices.size,
+      total_distance_km: tripStats.total_distance_km,
+      driving_hours: tripStats.driving_hours,
+      idling_hours: tripStats.idling_hours,
+      active_devices: tripStats.active_devices,
+      active_device_count: tripStats.active_device_count,
       exception_count_raw: exceptionCountRaw,
       weighted_exceptions: round(weightedExceptions, 2),
       exceptions_by_category: exceptionsByCategory,
@@ -115,22 +108,6 @@ function buildWeeklyMetrics(weekWindows, tripsByWeek, exceptionsByWeek, ruleMapp
   }
 
   return weekly;
-}
-
-// trips_by_week (lista de arrays de Trip crudo) -> {device_id: horas de manejo
-// totales en el período}, para cruzar con las horas de ralentí por vehículo
-// (fuel.js computeIdlingCost) y armar la eficiencia de ralentí.
-function computeDrivingHoursByDevice(tripsByWeek) {
-  const drivingHours = {};
-  for (const trips of tripsByWeek) {
-    for (const trip of trips) {
-      const deviceId = (trip.device || {}).id;
-      if (deviceId) {
-        drivingHours[deviceId] = (drivingHours[deviceId] || 0) + durationToHours(trip.drivingDuration);
-      }
-    }
-  }
-  return drivingHours;
 }
 
 // Calcula safety / efficiency / utilization / overall (0-100) para una semana.

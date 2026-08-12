@@ -254,6 +254,57 @@ async function fetchFuelDiagnosticDelta(api, devicesById, diagnosticId, periodSt
   return { byDevice, weekly };
 }
 
+// Agrupa las filas de DeviceActivitySummary (fetchDeviceActivitySummary,
+// feed.js -- 1 fila por vehículo por día) contra nuestros propios
+// weekWindows y devicesById, sumando distancia/horas de manejo/ralentí por
+// semana y por vehículo. Reemplaza la agregación que antes se hacía
+// recorriendo cada Trip individual.
+//
+// Se usa reportSubGroup "Daily" (no "Weekly") a propósito: así el
+// bucketeo por semana lo controlamos nosotros mismos contra weekWindows,
+// sin depender de que el agrupamiento semanal interno de Geotab esté
+// alineado a nuestros límites de semana (lunes UTC).
+//
+// Cada fila trae el objeto Device completo embebido (entity), no solo su id
+// -- se descarta todo salvo el id, no hace falta filtrar el resto acá.
+function aggregateActivityByWeek(rows, weekWindows, devicesById) {
+  const weekly = weekWindows.map(() => ({
+    total_distance_km: 0, driving_hours: 0, idling_hours: 0, active_devices: new Set(),
+  }));
+  const distanceByDevice = {};
+  const drivingHoursByDevice = {};
+
+  for (const row of rows) {
+    const deviceId = (row.entity || {}).id;
+    if (!deviceId || devicesById[deviceId] === undefined) continue;
+    const weekIdx = weekIndexForIso(weekWindows, row.periodStartDate);
+    if (weekIdx < 0) continue;
+
+    const distanceKm = parseFloat(row.distance) || 0;
+    const drivingHours = durationToHours(row.drivingDuration);
+    const idlingHours = durationToHours(row.idlingDuration);
+
+    const wk = weekly[weekIdx];
+    wk.total_distance_km += distanceKm;
+    wk.driving_hours += drivingHours;
+    wk.idling_hours += idlingHours;
+    if (distanceKm > 0) wk.active_devices.add(deviceId);
+
+    distanceByDevice[deviceId] = (distanceByDevice[deviceId] || 0) + distanceKm;
+    drivingHoursByDevice[deviceId] = (drivingHoursByDevice[deviceId] || 0) + drivingHours;
+  }
+
+  const weeklyTripStats = weekly.map(wk => ({
+    total_distance_km: round(wk.total_distance_km, 1),
+    driving_hours: round(wk.driving_hours, 1),
+    idling_hours: round(wk.idling_hours, 1),
+    active_devices: wk.active_devices,
+    active_device_count: wk.active_devices.size,
+  }));
+
+  return { weeklyTripStats, distanceByDevice, drivingHoursByDevice };
+}
+
 // params: { database, fromDate, toDate, ruleMapping, groupFilterId, dbSettings }
 async function buildDashboardData(api, params) {
   const { database, fromDate, toDate, ruleMapping, groupFilterId, dbSettings } = params;
@@ -290,14 +341,13 @@ async function buildDashboardData(api, params) {
 
   const weekWindows = buildWeekWindowsForRange(fromDate, toDate);
 
-  // Trip: Get por rango de fechas (fetchTripRecords en feed.js), sin
-  // deviceSearch -- nunca 1 llamada por vehículo, Geotab devuelve los
-  // registros de toda la flota juntos. Cacheado por rango exacto con TTL
-  // corto (evita repetir la llamada si se re-analiza el mismo rango poco
-  // después), pero sin cursor incremental: un rango de fechas distinto
-  // siempre se vuelve a pedir completo. Es global, sin scope de grupo -- por
-  // eso el filtro por dispositivo de abajo no es solo backstop, es el único
-  // lugar donde se aplica el filtro de grupo.
+  // Distancia/horas de manejo/ralentí: ya no salen de Trip individuales, sino
+  // del reporte DeviceActivitySummary (fetchDeviceActivitySummary en
+  // feed.js), que Geotab ya devuelve agregado por vehículo por día -- evita
+  // traer y sumar cada Trip (potencialmente cientos de miles de registros
+  // para una flota grande). Es global, sin scope de grupo -- por eso el
+  // filtro por dispositivo dentro de aggregateActivityByWeek no es solo
+  // backstop, es el único lugar donde se aplica el filtro de grupo.
   //
   // ExceptionEvent sigue en GetFeed (sí tiene sentido el cursor incremental
   // acá: no cambia de rango de fechas entre corridas, solo de reglas
@@ -308,8 +358,8 @@ async function buildDashboardData(api, params) {
   // built-in de ralentí de Geotab (IDLING_RULE_ID) aunque no esté tildada en
   // "Configurar": el costo de ralentí la usa siempre (ver más abajo).
   const exceptionRuleIds = new Set([...Object.keys(ruleMapping), IDLING_RULE_ID]);
-  const [allTrips, exceptionsByRuleFeed] = await Promise.all([
-    fetchTripRecords(api, database, fromDate, toDate),
+  const [activityRows, exceptionsByRuleFeed] = await Promise.all([
+    fetchDeviceActivitySummary(api, database, fromDate, toDate),
     Promise.all([...exceptionRuleIds].map(ruleId => fetchFeedRecords(
       api, database, "ExceptionEvent", "activeFrom", fromDate,
       { key: ruleId, search: { ruleSearch: { id: ruleId } } }
@@ -317,29 +367,18 @@ async function buildDashboardData(api, params) {
   ]);
   const allExceptions = [].concat(...exceptionsByRuleFeed);
 
-  let tripsByWeek = weekWindows.map(([weekStart, weekEnd]) => {
-    const from = weekStart.toISOString(), to = weekEnd.toISOString();
-    return allTrips.filter(t => t.start >= from && t.start < to);
-  });
   let exceptionsByWeek = weekWindows.map(([weekStart, weekEnd]) => {
     const from = weekStart.toISOString(), to = weekEnd.toISOString();
     return allExceptions.filter(ev => ev.activeFrom >= from && ev.activeFrom < to);
   });
-
   // Filtro por dispositivo: cubre la exclusión por número de serie y el
-  // filtro de grupo elegido (scopedGroupIds), ninguno de los cuales se
-  // aplica server-side sobre el feed global.
-  tripsByWeek = tripsByWeek.map(trips => trips.filter(t => devicesById[(t.device || {}).id] !== undefined));
+  // filtro de grupo elegido (scopedGroupIds), que no se aplica server-side
+  // sobre el feed global.
   exceptionsByWeek = exceptionsByWeek.map(evs => evs.filter(ev => devicesById[(ev.device || {}).id] !== undefined));
-
-  const distanceByDevice = {};
-  for (const trips of tripsByWeek) {
-    for (const trip of trips) {
-      const deviceId = (trip.device || {}).id;
-      if (deviceId) distanceByDevice[deviceId] = (distanceByDevice[deviceId] || 0) + (parseFloat(trip.distance) || 0);
-    }
-  }
   const exceptionsAll = [].concat(...exceptionsByWeek);
+
+  const { weeklyTripStats, distanceByDevice, drivingHoursByDevice } =
+    aggregateActivityByWeek(activityRows, weekWindows, devicesById);
 
   const fuelCfg = dbSettings.fuel || {};
   const pricePerLiter = fuelCfg.price_per_liter || 0;
@@ -390,7 +429,6 @@ async function buildDashboardData(api, params) {
     idleRatesCfg, devicesById, pricePerLiter, idleRuleIds
   );
 
-  const drivingHoursByDevice = computeDrivingHoursByDevice(tripsByWeek);
   for (const v of idlingCost.by_vehicle) {
     const drivingHours = round(drivingHoursByDevice[v.device_id] || 0, 1);
     v.driving_hours = drivingHours;
@@ -420,7 +458,7 @@ async function buildDashboardData(api, params) {
   );
   const savingsOpportunity = computeSavingsOpportunity(idlingCost, fuelConsumption, pricePerLiter);
 
-  const weeklyMetrics = buildWeeklyMetrics(weekWindows, tripsByWeek, exceptionsByWeek, ruleMapping, RULE_CATEGORY_WEIGHTS);
+  const weeklyMetrics = buildWeeklyMetrics(weekWindows, weeklyTripStats, exceptionsByWeek, ruleMapping, RULE_CATEGORY_WEIGHTS);
   const weeklyScores = weeklyMetrics.map(wm => computeWeekScore(wm, totalDeviceCount, SCORING_WEIGHTS, EFFICIENCY_IDLE_PENALTY_FACTOR));
 
   const opportunities = detectOpportunities(weeklyMetrics, weeklyScores, devicesById, TREND_CHANGE_THRESHOLD_PCT);
@@ -430,7 +468,6 @@ async function buildDashboardData(api, params) {
     : { safety: 0, efficiency: 0, utilization: 0, overall: 0 };
 
   const totalDistancePeriod = round(weeklyMetrics.reduce((s, wm) => s + wm.total_distance_km, 0), 1);
-  const totalTripsPeriod = tripsByWeek.reduce((s, t) => s + t.length, 0);
   const activeLastWeek = weeklyMetrics.length ? weeklyMetrics[weeklyMetrics.length - 1].active_device_count : 0;
 
   const evolution = weeklyMetrics.map((wm, i) => {
@@ -487,7 +524,6 @@ async function buildDashboardData(api, params) {
       total_devices: totalDeviceCount,
       active_last_week: activeLastWeek,
       total_distance_km_period: totalDistancePeriod,
-      total_trips_period: totalTripsPeriod,
     },
   };
 }

@@ -1019,7 +1019,6 @@ function App({ api, database }) {
             e("div", { className: "summary-row" }, e("span", null, "Vehículos totales"), e("span", null, data.fleet_summary.total_devices)),
             e("div", { className: "summary-row" }, e("span", null, "Activos última semana"), e("span", null, data.fleet_summary.active_last_week)),
             e("div", { className: "summary-row" }, e("span", null, "Distancia recorrida (período)"), e("span", null, data.fleet_summary.total_distance_km_period.toLocaleString() + " km")),
-            e("div", { className: "summary-row" }, e("span", null, "Viajes en el período"), e("span", null, data.fleet_summary.total_trips_period)),
             e("div", { className: "summary-row" }, e("span", null, "Generado"), e("span", null, new Date(data.generated_at).toLocaleString()))
           )
         ),
