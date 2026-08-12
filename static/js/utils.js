@@ -7,56 +7,6 @@ function round(value, decimals) {
   return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
-function chunked(items, size) {
-  const out = [];
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-  return out;
-}
-
-// Ejecuta fn sobre items con a lo sumo `limit` llamadas en simultáneo (en vez
-// de todas a la vez con Promise.all, o una por una en serie). Devuelve los
-// resultados en el mismo orden que items. Usado para mandar los chunks de
-// ExecuteMultiCall en paralelo pero acotado -- la propia guía de Geotab
-// ("Designing Reliable Integrations") pide "a modest number of independent,
-// short reads" en vez de sin límite, para no gatillar rate limiting.
-async function mapWithConcurrency(items, limit, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await fn(items[i], i);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
-}
-
-// Variante de mapWithConcurrency para llamadas independientes entre sí donde
-// interesa quedarse con lo que sí se llegó a traer si alguna falla a mitad de
-// camino (ej. se corta la conexión después de N de M chunks de multiCall):
-// onResult(item, index, result) se llama por cada chunk que termina bien, en
-// el momento en que termina (no espera a los demás), así el caller puede
-// mergear ahí mismo aunque después otro chunk falle. Al final relanza el
-// primer error visto (si hubo alguno), para que el caller sepa que el
-// resultado es parcial -- pero ya con todo lo que sí se pudo mergear.
-async function mapWithConcurrencySettled(items, limit, fn, onResult) {
-  let next = 0;
-  let firstError = null;
-  async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      try {
-        onResult(items[i], i, await fn(items[i], i));
-      } catch (err) {
-        if (!firstError) firstError = err;
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  if (firstError) throw firstError;
-}
-
 // Reintentos con backoff exponencial + jitter, como recomienda la guía de
 // integraciones de Geotab ante rate limiting/errores transitorios ("Retry a
 // bounded number of times with exponential backoff and jitter"). No hay forma

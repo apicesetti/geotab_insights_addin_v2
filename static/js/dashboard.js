@@ -5,12 +5,6 @@
 // credenciales, sin CORS.
 
 const EXCLUDED_SERIAL_NUMBERS = new Set(["", "000-000-0000"]);
-const FUEL_MULTICALL_CHUNK_SIZE = 200;
-// Cuántos chunks de ExecuteMultiCall se mandan en simultáneo. La guía de
-// Geotab pide "a modest number" en vez de todos a la vez -- 4 es un punto
-// intermedio: en una flota de 1300 vehículos (7 chunks de 200) esto baja de 7
-// round-trips en serie a ~2, sin acercarse al volumen que gatilla rate limiting.
-const MULTICALL_CONCURRENCY = 4;
 const WEEKS_DEFAULT = 12;
 
 // Antes vivían en config.json > scoring, compartidas por todas las bases de
@@ -263,6 +257,10 @@ async function buildDashboardData(api, params) {
 
   let totalFuelByDevice = {};
   let weeklyFuelLiters = new Array(weekWindows.length).fill(0);
+  // Se guarda fuera del try (scope de toda buildDashboardData) porque el
+  // bloque de combustible de ralentí más abajo lo reusa para correlacionar
+  // contra los eventos de ralentí en memoria, sin pedir FuelUsed de nuevo.
+  let fuelUsedData = [];
   try {
     // OJO: antes esto era un Get() sin resultsLimit por TODO el período y
     // TODA la flota de una sola vez -- Geotab trunca en silencio si hay más
@@ -273,7 +271,7 @@ async function buildDashboardData(api, params) {
     // global (no scopeado por grupo) -- el filtro de grupo se aplica igual
     // que en Trip, con el devicesById de más abajo.
     const allFuelUsed = await fetchFeedRecords(api, database, "FuelUsed", "fromDate", periodStart);
-    const fuelUsedData = allFuelUsed.filter(r => r.fromDate && r.fromDate < periodEnd.toISOString());
+    fuelUsedData = allFuelUsed.filter(r => r.fromDate && r.fromDate < periodEnd.toISOString());
     const summed = sumFuelUsedByDevice(fuelUsedData, "totalFuelUsed");
     totalFuelByDevice = Object.fromEntries(Object.entries(summed).filter(([d]) => devicesById[d] !== undefined));
     weeklyFuelLiters = sumByWeek(fuelUsedData, weekWindows, "fromDate", "totalFuelUsed");
@@ -317,53 +315,44 @@ async function buildDashboardData(api, params) {
       // Diagnóstico no disponible en esta base de datos.
     }
   } else {
-    // Por evento de ralentí en vez de agregado: cada llamada a FuelUsed cuenta contra el
-    // límite de la API, así que con muchos eventos esto puede agotarse a mitad de camino.
-    // Se procesa chunk a chunk para quedarnos con lo que se llegó a traer.
+    // Por evento de ralentí en vez de agregado, pero SIN pedir nada de nuevo a
+    // la API: antes esto era 1 llamada Get por evento (fromDate/toDate = la
+    // ventana exacta del evento), agrupadas en multiCall -- con miles de
+    // eventos de ralentí por mes (flotas grandes, muchos km) esas sub-calls
+    // solas superaban la cuota de multiCall (1500/min), aparte de ser lento.
     //
-    // A diferencia de fetchFuelDiagnosticSnapshot (una sola llamada Get para
-    // toda la flota), acá NO se puede scopear ancho en 1 sola llamada: cada
-    // evento tiene su propia ventana activeFrom/activeTo, no hay un
-    // fromDate/toDate común para toda la flota. Traer todo el rango del
-    // período de una sola vez y filtrar client-side reabriría el mismo bug de
-    // truncamiento silencioso que ya se corrigió para FuelUsed agregado (ver
-    // buildDashboardData) -- acá multiCall sigue siendo lo correcto.
+    // fuelUsedData ya tiene TODOS los registros de FuelUsed de la flota en el
+    // período (se trajo una sola vez más arriba, vía GetFeed, para el total
+    // de combustible). Cada registro trae su propio fromDate -- el mismo
+    // campo que Geotab usaba para filtrar server-side cuando pedíamos por
+    // evento -- así que replicamos ese filtro (fromDate dentro de la ventana
+    // del evento) en memoria sobre lo que ya tenemos, sin ninguna llamada
+    // adicional. totalIdlingFuelUsedL es un valor fijo por registro: no
+    // cambia según cómo se lo pida, así que el resultado es idéntico al de
+    // antes, evento por evento.
     const idleEventDeviceIds = new Set();
-    try {
-      const idleCalls = [];
-      const idleCallDevices = [];
-      const idleCallWeekIdx = [];
-      for (const ev of idlingEvents) {
-        const deviceId = (ev.device || {}).id;
-        const activeFrom = ev.activeFrom;
-        const activeTo = ev.activeTo;
-        if (!deviceId || !activeFrom || !activeTo) continue;
-        idleEventDeviceIds.add(deviceId);
-        idleCalls.push(["Get", { typeName: "FuelUsed", search: { deviceSearch: { id: deviceId }, fromDate: activeFrom, toDate: activeTo } }]);
-        idleCallDevices.push(deviceId);
-        idleCallWeekIdx.push(weekIndexForIso(weekWindows, activeFrom));
+    const fuelUsedByDevice = new Map();
+    for (const r of fuelUsedData) {
+      const deviceId = (r.device || {}).id;
+      if (!deviceId || !r.fromDate) continue;
+      if (!fuelUsedByDevice.has(deviceId)) fuelUsedByDevice.set(deviceId, []);
+      fuelUsedByDevice.get(deviceId).push(r);
+    }
+    for (const ev of idlingEvents) {
+      const deviceId = (ev.device || {}).id;
+      const activeFrom = ev.activeFrom;
+      const activeTo = ev.activeTo;
+      if (!deviceId || !activeFrom || !activeTo) continue;
+      idleEventDeviceIds.add(deviceId);
+      const deviceRecords = fuelUsedByDevice.get(deviceId);
+      if (!deviceRecords) continue;
+      const weekIdx = weekIndexForIso(weekWindows, activeFrom);
+      for (const r of deviceRecords) {
+        if (r.fromDate < activeFrom || r.fromDate >= activeTo) continue;
+        const liters = parseFloat(r.totalIdlingFuelUsedL != null ? r.totalIdlingFuelUsedL : r.totalFuelUsed) || 0;
+        idleFuelByDevice[deviceId] = (idleFuelByDevice[deviceId] || 0) + liters;
+        if (weekIdx >= 0) weeklyIdleLiters[weekIdx] += liters;
       }
-      const callChunks = chunked(idleCalls, FUEL_MULTICALL_CHUNK_SIZE);
-      const deviceChunks = chunked(idleCallDevices, FUEL_MULTICALL_CHUNK_SIZE);
-      const weekIdxChunks = chunked(idleCallWeekIdx, FUEL_MULTICALL_CHUNK_SIZE);
-      // Igual que fetchFuelDiagnosticSnapshot pero con mapWithConcurrencySettled:
-      // chunks en paralelo (acotado), mergeando cada uno apenas termina -- si
-      // uno falla a mitad de camino, los que sí terminaron ya quedaron
-      // mergeados (el throw al final solo cae en el catch de abajo, que no
-      // descarta lo ya acumulado). Sigue valiendo "nos quedamos con lo que se
-      // llegó a traer", igual que antes con el for secuencial.
-      await mapWithConcurrencySettled(callChunks, MULTICALL_CONCURRENCY, chunk => api.multiCall(chunk), (chunk, c, chunkResults) => {
-        deviceChunks[c].forEach((deviceId, i) => {
-          const weekIdx = weekIdxChunks[c][i];
-          for (const r of (chunkResults[i] || [])) {
-            const liters = parseFloat(r.totalIdlingFuelUsedL != null ? r.totalIdlingFuelUsedL : r.totalFuelUsed) || 0;
-            idleFuelByDevice[deviceId] = (idleFuelByDevice[deviceId] || 0) + liters;
-            if (weekIdx >= 0) weeklyIdleLiters[weekIdx] += liters;
-          }
-        });
-      });
-    } catch (err) {
-      // No se pudo medir combustible de ralentí por evento en esta base.
     }
 
     // FuelUsed es Geotab calculándolo a partir de telemetría de motor (RPM,
