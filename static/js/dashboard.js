@@ -96,40 +96,55 @@ async function fetchGroupTree(api, database) {
   return buildGroupTree(groups);
 }
 
+// resultsLimit de las llamadas Get de una sola ronda (snapshot fleet-wide):
+// a diferencia de GetFeed, Get no tiene cursor de continuación, así que si se
+// trunca no hay forma de pedir "el resto" -- por eso acá SÍ hace falta un
+// número explícito y grande, y detectar el truncamiento comparando contra él
+// (ver abajo) en vez de confiar en que "vino menos de lo pedido = no hay más".
+const SNAPSHOT_RESULTS_LIMIT = 50000;
+
 // {device_id: valor} de un diagnóstico contador acumulado (StatusData) "a la
-// fecha" (snapshot), para toda la flota en 1 ronda de multiCall (chunked).
+// fecha" (snapshot) para toda la flota, en 1 sola llamada Get (sin
+// deviceSearch, scopeada solo por diagnosticId) en vez de 1 llamada por
+// vehículo agrupada en multiCall -- mismo principio que el feed de
+// ExceptionEvent por regla (feed.js): scopear ancho y traer todos los
+// vehículos en una respuesta, en vez de tantas llamadas como vehículos.
 // Geotab resuelve fromDate == toDate como el último valor conocido a esa
-// fecha en vez de un rango, así que esto trae 1 registro por vehículo en vez
-// de todo su historial -- la base del método de deltas por snapshot de abajo.
+// fecha en vez de un rango, así que esto trae 1 registro por vehículo (nunca
+// su historial completo) -- para una flota de miles de vehículos el total
+// queda muy por debajo de SNAPSHOT_RESULTS_LIMIT, sin el riesgo de
+// truncamiento silencioso que si existía para queries de rango completo (ver
+// el comentario sobre el bug de FuelUsed más abajo en buildDashboardData).
 async function fetchFuelDiagnosticSnapshot(api, deviceIdsList, diagnosticId, atDate) {
   const atIso = atDate.toISOString();
-  const calls = deviceIdsList.map(deviceId => ["Get", {
+  const deviceIdSet = new Set(deviceIdsList);
+  const records = await api.call("Get", {
     typeName: "StatusData",
-    search: {
-      fromDate: atIso, toDate: atIso,
-      diagnosticSearch: { id: diagnosticId },
-      deviceSearch: { id: deviceId },
-    },
-  }]);
-  const values = {};
-  const callChunks = chunked(calls, FUEL_MULTICALL_CHUNK_SIZE);
-  const deviceChunks = chunked(deviceIdsList, FUEL_MULTICALL_CHUNK_SIZE);
-  // Chunks en paralelo (acotado a MULTICALL_CONCURRENCY) en vez de uno por uno
-  // en serie: en flotas grandes esto es la mayor parte del tiempo de espera.
-  const chunkResultsList = await mapWithConcurrency(callChunks, MULTICALL_CONCURRENCY, chunk => api.multiCall(chunk));
-  chunkResultsList.forEach((chunkResults, c) => {
-    deviceChunks[c].forEach((deviceId, i) => {
-      const rec = (chunkResults[i] || [])[0];
-      if (rec && rec.data != null) values[deviceId] = Number(rec.data);
-    });
+    resultsLimit: SNAPSHOT_RESULTS_LIMIT,
+    search: { fromDate: atIso, toDate: atIso, diagnosticSearch: { id: diagnosticId } },
   });
+  if (records.length >= SNAPSHOT_RESULTS_LIMIT) {
+    // Señal de truncamiento: vinieron exactamente (o más de) los que pedimos
+    // como tope. Preferimos fallar fuerte (el caller ya tiene try/catch y cae
+    // a "sin datos de combustible") antes que devolver un snapshot parcial
+    // que subestime combustible/ralentí sin que se note.
+    throw new Error(`StatusData snapshot truncado (>= ${SNAPSHOT_RESULTS_LIMIT} registros) para diagnóstico ${diagnosticId}`);
+  }
+  const values = {};
+  for (const rec of records) {
+    const deviceId = (rec.device || {}).id;
+    // deviceIdSet filtra por el scope real pedido (ej. un grupo de la
+    // flota): la llamada no está scopeada por device, así que puede traer
+    // vehículos fuera del filtro elegido en la UI.
+    if (deviceId && deviceIdSet.has(deviceId) && rec.data != null) values[deviceId] = Number(rec.data);
+  }
   return values;
 }
 
 // {device_id: litros} a partir de un diagnóstico contador acumulado (StatusData),
 // comparando su valor "a la fecha" al inicio y al fin del período (2 rondas de
-// multiCall para toda la flota, vía fetchFuelDiagnosticSnapshot) en vez de traer
-// y acumular todo el historial de registros del período -- mucho más liviano, y
+// fetchFuelDiagnosticSnapshot, 1 llamada Get cada una para toda la flota) en vez
+// de traer y acumular todo el historial de registros del período -- mucho más liviano, y
 // sin el riesgo de truncamiento silencioso de Geotab en diagnósticos de
 // muestreo muy frecuente (fuel total, idle fuel). Usado tanto para ralentí
 // (IDLE_FUEL_STATUS_DIAGNOSTIC_ID) como para combustible total
@@ -305,6 +320,14 @@ async function buildDashboardData(api, params) {
     // Por evento de ralentí en vez de agregado: cada llamada a FuelUsed cuenta contra el
     // límite de la API, así que con muchos eventos esto puede agotarse a mitad de camino.
     // Se procesa chunk a chunk para quedarnos con lo que se llegó a traer.
+    //
+    // A diferencia de fetchFuelDiagnosticSnapshot (una sola llamada Get para
+    // toda la flota), acá NO se puede scopear ancho en 1 sola llamada: cada
+    // evento tiene su propia ventana activeFrom/activeTo, no hay un
+    // fromDate/toDate común para toda la flota. Traer todo el rango del
+    // período de una sola vez y filtrar client-side reabriría el mismo bug de
+    // truncamiento silencioso que ya se corrigió para FuelUsed agregado (ver
+    // buildDashboardData) -- acá multiCall sigue siendo lo correcto.
     const idleEventDeviceIds = new Set();
     try {
       const idleCalls = [];

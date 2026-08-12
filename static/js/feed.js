@@ -22,7 +22,11 @@
 
 const FEED_DB_NAME = "geotab_insights_feed_cache";
 const FEED_DB_VERSION = 1;
-const FEED_RESULTS_LIMIT = 50000;
+// null = no se manda resultsLimit: Geotab aplica su propio máximo por tipo de
+// entidad ("type-specific overrides"), que puede ser mayor al que nosotros
+// adivinaríamos a mano -- y como drainFeed ya no depende de este número para
+// saber cuándo cortar (ver abajo), no hace falta fijarlo.
+const FEED_RESULTS_LIMIT = null;
 const FEED_MAX_AGE_DAYS = 400; // poda: no tiene sentido guardar más que el rango más amplio que se pueda pedir desde la UI
 
 // GetFeed tiene su propio límite de tasa en MyGeotab, aparte del resto de la
@@ -152,7 +156,8 @@ async function drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, see
   let version = fromVersion;
   let first = true;
   while (true) {
-    const params = { typeName, resultsLimit: FEED_RESULTS_LIMIT };
+    const params = { typeName };
+    if (FEED_RESULTS_LIMIT != null) params.resultsLimit = FEED_RESULTS_LIMIT;
     const search = { ...(scopeSearch || {}) };
     if (first && seedFromDate) search.fromDate = seedFromDate;
     if (Object.keys(search).length) params.search = search;
@@ -162,7 +167,12 @@ async function drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, see
     if (data.length) await putRecords(db, feedKey, dateField, data);
     version = page && page.toVersion;
     first = false;
-    if (data.length < FEED_RESULTS_LIMIT) break;
+    // Página vacía = no hay más backlog. No comparamos contra el resultsLimit
+    // pedido: si Geotab aplica un tope propio menor (overrides por tipo de
+    // entidad), una página completa podría volver con menos de lo pedido y
+    // esa comparación cortaría el drenado antes de tiempo, truncando en
+    // silencio -- el mismo bug que ya se corrigió una vez para FuelUsed.
+    if (!data.length) break;
   }
   return version;
 }
