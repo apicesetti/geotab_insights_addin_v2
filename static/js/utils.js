@@ -22,25 +22,36 @@ const GET_RANGE_RESULTS_LIMIT = 50000;
 // que "resultsLimit truncates a response; by itself, it does not prove that
 // the complete result was returned" -- una página puede volver con MENOS del
 // límite pedido y aun así no ser todo. La única señal confiable de "no hay
-// más" es que una página vuelva vacía. Se ordena por "id" (campo único en
-// cualquier entidad de Geotab) en vez de por un campo de fecha específico,
-// para no tener que adivinar cómo se llama ese campo en cada typeName --
-// lastId es solo para desambiguar campos NO únicos (ej. date/name); con "id"
-// (ya único de por sí) Geotab lo rechaza directamente ("Last id can not be
-// used with sort by id").
-async function fetchGetPaginated(api, typeName, extraSearch, fromDate, toDate) {
+// más" es que una página vuelva vacía.
+//
+// sortBy no es uniforme entre tipos -- confirmado contra la API real: Trip
+// acepta "id", pero StatusData lo rechaza ("Can not sort by id. Supported
+// sortable fields are date, version."). Por eso el caller lo indica
+// explícito, junto con offsetField (el nombre del campo en el objeto
+// devuelto que corresponde a ese sortBy, ej. "id" o "dateTime") para poder
+// armar el offset de la página siguiente. Con "id" (campo único) Geotab
+// rechaza lastId de plano; con cualquier otro campo (no único, ej. date)
+// lastId es obligatorio para no perder registros en el borde de cada página.
+async function fetchGetPaginated(api, typeName, extraSearch, fromDate, toDate, sortBy, offsetField) {
+  sortBy = sortBy || "id";
+  offsetField = offsetField || "id";
   const out = [];
   let offset = null;
+  let lastId = null;
   while (true) {
+    const sort = { sortBy, sortDirection: "asc", offset };
+    if (sortBy !== "id") sort.lastId = lastId;
     const page = await api.call("Get", {
       typeName,
       resultsLimit: GET_RANGE_RESULTS_LIMIT,
       search: { ...(extraSearch || {}), fromDate: fromDate.toISOString(), toDate: toDate.toISOString() },
-      sort: { sortBy: "id", sortDirection: "asc", offset },
+      sort,
     });
     if (!page || !page.length) break;
     out.push(...page);
-    offset = page[page.length - 1].id;
+    const last = page[page.length - 1];
+    offset = last[offsetField];
+    lastId = last.id;
   }
   return out;
 }

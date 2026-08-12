@@ -100,7 +100,10 @@ async function fetchGroupTree(api, database) {
 // real. No hay forma de pedir "el valor a tal fecha" directo: hay que traer
 // el rango real completo y derivarlo en memoria (snapshotFromSeriesAt).
 async function fetchFuelDiagnosticRange(api, diagnosticId, periodStart, periodEnd) {
-  const records = await fetchGetPaginated(api, "StatusData", { diagnosticSearch: { id: diagnosticId } }, periodStart, periodEnd);
+  // StatusData no acepta sortBy "id" ("Can not sort by id. Supported
+  // sortable fields are date, version.") -- se pagina por "date" (offset =
+  // el campo dateTime del último registro de la página anterior).
+  const records = await fetchGetPaginated(api, "StatusData", { diagnosticSearch: { id: diagnosticId } }, periodStart, periodEnd, "date", "dateTime");
   const seriesByDevice = {};
   for (const r of records) {
     const deviceId = (r.device || {}).id;
