@@ -22,7 +22,7 @@
 
 const FEED_DB_NAME = "geotab_insights_feed_cache";
 const FEED_DB_VERSION = 1;
-const FEED_RESULTS_LIMIT = 10000;
+const FEED_RESULTS_LIMIT = None; 
 const FEED_MAX_AGE_DAYS = 400; // poda: no tiene sentido guardar más que el rango más amplio que se pueda pedir desde la UI
 
 function openFeedDb() {
