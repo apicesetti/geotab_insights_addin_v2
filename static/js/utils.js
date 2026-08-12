@@ -66,21 +66,41 @@ async function mapWithConcurrencySettled(items, limit, fn, onResult) {
 // el problema es la request en sí (mal formada, sin permisos, versión de feed
 // vencida), no algo que un reintento vaya a arreglar.
 const RETRY_SKIP_PATTERN = /invalid|missing|unauthorized|forbidden|permission|not found|does not exist|malformed|unsupported/i;
+// OverLimitException (cuota de llamadas por minuto excedida, ej. GetFeed:
+// "60 per 1m"): un backoff exponencial normal (tope 8s) no sirve porque el
+// límite es por ventana de 1 minuto -- para cuando termina de reintentar
+// sigue adentro de la misma ventana. Estos matchean tanto err.name ("Over
+// LimitException") como el texto del mensaje que devuelve Geotab.
+const RETRY_RATE_LIMIT_PATTERN = /overlimit|quota exceeded|maximum admitted|too many requests/i;
 const RETRY_MAX_ATTEMPTS = 4;
 const RETRY_BASE_DELAY_MS = 500;
 const RETRY_MAX_DELAY_MS = 8000;
+const RETRY_RATE_LIMIT_MAX_ATTEMPTS = 2;
+const RETRY_RATE_LIMIT_DELAY_MS = 65000; // > 1 minuto: asegura que la ventana del límite ya rotó
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function errorText(err) {
+  const dataType = err && err.data && err.data.type;
+  return [err && err.name, err && err.message, dataType].filter(Boolean).join(" ");
+}
+
 async function callWithRetry(fn) {
   let attempt = 0;
+  let rateLimitAttempt = 0;
   while (true) {
     try {
       return await fn();
     } catch (err) {
-      const text = ((err && err.name) || "") + " " + ((err && err.message) || "");
+      const text = errorText(err);
+      if (RETRY_RATE_LIMIT_PATTERN.test(text)) {
+        rateLimitAttempt++;
+        if (rateLimitAttempt > RETRY_RATE_LIMIT_MAX_ATTEMPTS) throw err;
+        await sleep(RETRY_RATE_LIMIT_DELAY_MS + Math.random() * 5000);
+        continue;
+      }
       attempt++;
       if (attempt >= RETRY_MAX_ATTEMPTS || RETRY_SKIP_PATTERN.test(text)) throw err;
       const backoff = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));

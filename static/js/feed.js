@@ -22,8 +22,40 @@
 
 const FEED_DB_NAME = "geotab_insights_feed_cache";
 const FEED_DB_VERSION = 1;
-const FEED_RESULTS_LIMIT = null;
+const FEED_RESULTS_LIMIT = 50000;
 const FEED_MAX_AGE_DAYS = 400; // poda: no tiene sentido guardar más que el rango más amplio que se pueda pedir desde la UI
+
+// GetFeed tiene su propio límite de tasa en MyGeotab, aparte del resto de la
+// API: 60 llamadas por minuto (con overrides según el tipo de entidad). Con
+// varias reglas mapeadas, dashboard.js pide un feed de ExceptionEvent por
+// regla en paralelo (además del feed de Trip) -- sin control, eso dispara
+// más de 60 GetFeed en el primer minuto y Geotab tira OverLimitException.
+// Este limitador de ventana deslizante se comparte entre TODAS las llamadas
+// a GetFeed de la sesión (sin importar desde qué feed/regla salen) para que
+// nunca se superen GETFEED_RATE_LIMIT llamadas en GETFEED_WINDOW_MS, puesto
+// bien por debajo del límite real para dejar margen a jitter/reintentos.
+const GETFEED_RATE_LIMIT = 50;
+const GETFEED_WINDOW_MS = 60000;
+let getFeedCallTimestamps = [];
+
+async function reserveGetFeedSlot() {
+  while (true) {
+    const now = Date.now();
+    getFeedCallTimestamps = getFeedCallTimestamps.filter(t => now - t < GETFEED_WINDOW_MS);
+    if (getFeedCallTimestamps.length < GETFEED_RATE_LIMIT) {
+      getFeedCallTimestamps.push(now);
+      return;
+    }
+    // Esperamos a que salga de la ventana la llamada más vieja de las registradas.
+    const waitMs = GETFEED_WINDOW_MS - (now - getFeedCallTimestamps[0]) + 50;
+    await sleep(Math.max(waitMs, 50));
+  }
+}
+
+async function callGetFeed(api, params) {
+  await reserveGetFeedSlot();
+  return api.call("GetFeed", params);
+}
 
 function openFeedDb() {
   return new Promise((resolve, reject) => {
@@ -125,7 +157,7 @@ async function drainFeed(api, db, feedKey, dateField, typeName, scopeSearch, see
     if (first && seedFromDate) search.fromDate = seedFromDate;
     if (Object.keys(search).length) params.search = search;
     if (version) params.fromVersion = version;
-    const page = await api.call("GetFeed", params);
+    const page = await callGetFeed(api, params);
     const data = (page && page.data) || [];
     if (data.length) await putRecords(db, feedKey, dateField, data);
     version = page && page.toVersion;
